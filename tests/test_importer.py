@@ -7,7 +7,7 @@ from pathlib import Path
 
 from certumalink_importer.cli import main
 from certumalink_importer.exporters import export_records
-from certumalink_importer.importer import import_zip_codes
+from certumalink_importer.importer import ImportStats, import_zip_codes
 from certumalink_importer.validation import validate_export
 from certumalink_importer.zipcodes import read_zip_file
 
@@ -106,6 +106,47 @@ class DuplicateZipClient:
         }
 
 
+class RepeatingPageClient:
+    def __init__(self) -> None:
+        self.pages_yielded = 0
+
+    def iter_zip_search(self, zip_code: str):
+        page = {
+            "results": [
+                {
+                    "number": 1234567890,
+                    "enumeration_type": "NPI-1",
+                    "basic": {
+                        "first_name": "Ada",
+                        "last_name": "Lovelace",
+                        "credential": "MD",
+                        "status": "A",
+                    },
+                    "taxonomies": [
+                        {
+                            "code": "207R00000X",
+                            "desc": "Internal Medicine",
+                            "primary": True,
+                        }
+                    ],
+                    "addresses": [
+                        {
+                            "address_purpose": "LOCATION",
+                            "country_code": "US",
+                            "address_1": "100 MAIN ST",
+                            "city": "Austin",
+                            "state": "TX",
+                            "postal_code": zip_code,
+                        }
+                    ],
+                }
+            ]
+        }
+        while True:
+            self.pages_yielded += 1
+            yield page
+
+
 class ImporterTests(unittest.TestCase):
     def test_reads_zip_file_with_header_and_zip4(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -145,6 +186,17 @@ class ImporterTests(unittest.TestCase):
 
         self.assertEqual(len(records), 2)
         self.assertEqual(client.pages_yielded, 1)
+
+    def test_import_stops_when_cms_repeats_a_page(self) -> None:
+        client = RepeatingPageClient()
+        stats = ImportStats(zip_count=1)
+
+        records = import_zip_codes(["78701"], client=client, stats=stats)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(client.pages_yielded, 2)
+        self.assertEqual(stats.source_records, 1)
+        self.assertEqual(stats.repeated_pages_stopped, 1)
 
     def test_export_and_validate_csv(self) -> None:
         records = import_zip_codes(["78701"], client=None, fixture_path=FIXTURE)  # type: ignore[arg-type]

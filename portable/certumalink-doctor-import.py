@@ -100,6 +100,7 @@ class ImportStats:
     imported_records: int = 0
     skipped_records: int = 0
     duplicate_npis: int = 0
+    repeated_pages_stopped: int = 0
 
     def to_log_payload(self) -> dict[str, int]:
         return {
@@ -109,6 +110,7 @@ class ImportStats:
             "imported_records": self.imported_records,
             "skipped_records": self.skipped_records,
             "duplicate_npis": self.duplicate_npis,
+            "repeated_pages_stopped": self.repeated_pages_stopped,
         }
 
 
@@ -197,6 +199,7 @@ def import_zip_codes(
     for zip_index, raw_zip in enumerate(zip_codes, start=1):
         zip_code = normalize_zip_code(raw_zip)
         _progress(progress, f"[{zip_index}/{stats.zip_count}] Starting ZIP {zip_code}")
+        seen_page_signatures: set[tuple[str, ...]] = set()
         responses: Iterable[Mapping[str, object]]
         if fixture_path is None:
             responses = client.iter_zip_search(zip_code)
@@ -210,6 +213,19 @@ def import_zip_codes(
             if not isinstance(results, list):
                 _progress(progress, f"[{zip_code}] Page {page_index}: skipped malformed response")
                 continue
+            page_signature = _page_signature(results)
+            if page_signature and page_signature in seen_page_signatures:
+                stats.repeated_pages_stopped += 1
+                _progress(
+                    progress,
+                    (
+                        f"[{zip_code}] Page {page_index}: CMS returned a repeated page; "
+                        "stopping this ZIP"
+                    ),
+                )
+                break
+            if page_signature:
+                seen_page_signatures.add(page_signature)
             stats.source_records += len(results)
             before_imported = stats.imported_records
             before_skipped = stats.skipped_records
@@ -526,6 +542,8 @@ def _print_report(
     print(f"Skipped records: {stats.skipped_records}")
     print(f"Duplicate NPIs merged: {stats.duplicate_npis}")
     print(f"CMS response pages: {stats.response_pages}")
+    if stats.repeated_pages_stopped:
+        print(f"Repeated CMS pages stopped: {stats.repeated_pages_stopped}")
     print(f"Validation: {'passed' if report.is_valid else 'failed'}")
     if not report.is_valid:
         print(report.summary())
@@ -540,6 +558,14 @@ def _print_progress(message: str) -> None:
 def _progress(callback: Callable[[str], None] | None, message: str) -> None:
     if callback is not None:
         callback(message)
+
+
+def _page_signature(results: list[object]) -> tuple[str, ...]:
+    numbers: list[str] = []
+    for result in results:
+        if isinstance(result, Mapping):
+            numbers.append(_clean(result.get("number")))
+    return tuple(numbers)
 
 
 def _read_export_rows(path: Path) -> list[dict[str, object]]:

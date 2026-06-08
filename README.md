@@ -25,6 +25,9 @@ prints a terminal report.
 During longer runs, it prints progress as each ZIP and CMS response page is
 processed, so users can tell the import is still working.
 
+If CMS starts returning the same page again during pagination, the importer
+detects that repeated NPI set and stops that ZIP instead of looping forever.
+
 You can also pass the ZIP directly:
 
 ```sh

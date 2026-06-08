@@ -22,6 +22,7 @@ class ImportStats:
     imported_records: int = 0
     skipped_records: int = 0
     duplicate_npis: int = 0
+    repeated_pages_stopped: int = 0
 
     def to_log_payload(self) -> dict[str, int]:
         return {
@@ -31,6 +32,7 @@ class ImportStats:
             "imported_records": self.imported_records,
             "skipped_records": self.skipped_records,
             "duplicate_npis": self.duplicate_npis,
+            "repeated_pages_stopped": self.repeated_pages_stopped,
         }
 
 
@@ -47,6 +49,7 @@ def import_zip_codes(
 
     for raw_zip in zip_codes:
         zip_code = normalize_zip_code(raw_zip)
+        seen_page_signatures: set[tuple[str, ...]] = set()
         if fixture_path is not None:
             responses = [_load_fixture(fixture_path)]
         else:
@@ -59,6 +62,12 @@ def import_zip_codes(
             results = response.get("results", [])
             if not isinstance(results, list):
                 continue
+            page_signature = _page_signature(results)
+            if page_signature and page_signature in seen_page_signatures:
+                import_stats.repeated_pages_stopped += 1
+                break
+            if page_signature:
+                seen_page_signatures.add(page_signature)
             import_stats.source_records += len(results)
             for result in results:
                 if not isinstance(result, Mapping):
@@ -95,3 +104,11 @@ def _load_fixture(path: Path) -> Mapping[str, object]:
     if not isinstance(payload, Mapping):
         raise ValueError(f"fixture must contain a JSON object: {path}")
     return payload
+
+
+def _page_signature(results: list[object]) -> tuple[str, ...]:
+    numbers: list[str] = []
+    for result in results:
+        if isinstance(result, Mapping):
+            numbers.append(str(result.get("number") or "").strip())
+    return tuple(numbers)
