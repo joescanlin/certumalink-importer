@@ -1,0 +1,156 @@
+{
+  "result_count": 5,
+  "results": [
+    {
+      "number": 1234567890,
+      "enumeration_type": "NPI-1",
+      "basic": {
+        "first_name": "Ada",
+        "middle_name": "M",
+        "last_name": "Lovelace",
+        "credential": "MD",
+        "status": "A"
+      },
+      "taxonomies": [
+        {
+          "code": "363L00000X",
+          "desc": "Nurse Practitioner",
+          "primary": false
+        },
+        {
+          "code": "207R00000X",
+          "desc": "Internal Medicine",
+          "primary": true
+        }
+      ],
+      "addresses": [
+        {
+          "address_purpose": "MAILING",
+          "country_code": "US",
+          "address_1": "PO BOX 1",
+          "city": "Austin",
+          "state": "TX",
+          "postal_code": "787010000"
+        },
+        {
+          "address_purpose": "LOCATION",
+          "country_code": "US",
+          "address_1": "100 MAIN ST",
+          "address_2": "STE 200",
+          "city": "Austin",
+          "state": "TX",
+          "postal_code": "78701-1234",
+          "telephone_number": "5125550100"
+        }
+      ]
+    },
+    {
+      "number": 2345678901,
+      "enumeration_type": "NPI-1",
+      "basic": {
+        "first_name": "Grace",
+        "last_name": "Hopper",
+        "credential": "NP",
+        "status": "A"
+      },
+      "taxonomies": [
+        {
+          "code": "363L00000X",
+          "desc": "Nurse Practitioner",
+          "primary": true
+        }
+      ],
+      "addresses": [
+        {
+          "address_purpose": "LOCATION",
+          "country_code": "US",
+          "address_1": "200 MAIN ST",
+          "city": "Austin",
+          "state": "TX",
+          "postal_code": "78701"
+        }
+      ]
+    },
+    {
+      "number": 3456789012,
+      "enumeration_type": "NPI-2",
+      "basic": {
+        "organization_name": "CERTUMA CLINIC",
+        "status": "A"
+      },
+      "taxonomies": [
+        {
+          "code": "261Q00000X",
+          "desc": "Clinic/Center",
+          "primary": true
+        }
+      ],
+      "addresses": [
+        {
+          "address_purpose": "LOCATION",
+          "country_code": "US",
+          "address_1": "300 MAIN ST",
+          "city": "Austin",
+          "state": "TX",
+          "postal_code": "78701"
+        }
+      ]
+    },
+    {
+      "number": 4567890123,
+      "enumeration_type": "NPI-1",
+      "basic": {
+        "first_name": "Inactive",
+        "last_name": "Physician",
+        "credential": "DO",
+        "status": "D",
+        "deactivation_date": "2020-01-01"
+      },
+      "taxonomies": [
+        {
+          "code": "208D00000X",
+          "desc": "General Practice",
+          "primary": true
+        }
+      ],
+      "addresses": [
+        {
+          "address_purpose": "LOCATION",
+          "country_code": "US",
+          "address_1": "400 MAIN ST",
+          "city": "Austin",
+          "state": "TX",
+          "postal_code": "78701"
+        }
+      ]
+    },
+    {
+      "number": 5678901234,
+      "enumeration_type": "NPI-1",
+      "basic": {
+        "first_name": "No",
+        "last_name": "Phone",
+        "credential": "MD",
+        "status": "A"
+      },
+      "taxonomies": [
+        {
+          "code": "208000000X",
+          "desc": "Pediatrics",
+          "primary": true
+        }
+      ],
+      "addresses": [
+        {
+          "address_purpose": "LOCATION",
+          "country_code": "US",
+          "address_1": "500 MAIN ST",
+          "city": "Austin",
+          "state": "TX",
+          "postal_code": "78701"
+        }
+      ]
+    }
+  ]
+}
+

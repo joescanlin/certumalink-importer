@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  scripts/import-doctors <zip-file.csv> <output.csv|output.json> [extra importer options]
+
+Examples:
+  scripts/import-doctors input/example_zips.csv output/austin-doctors.csv
+  scripts/import-doctors input/example_zips.csv output/austin-smoke.csv --max-pages 1
+  scripts/import-doctors input/example_zips.csv output/austin-doctors.json --format json
+
+The ZIP file can be a CSV or TXT file. If it has a header, use one of:
+zip, zipcode, zip_code, postal_code, postalcode.
+USAGE
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -lt 2 ]]; then
+  usage >&2
+  exit 2
+fi
+
+CALLING_DIR="$(pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+resolve_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$CALLING_DIR" "$1" ;;
+  esac
+}
+
+ZIP_FILE="$(resolve_path "$1")"
+OUT_FILE="$(resolve_path "$2")"
+shift 2
+
+cd "$ROOT_DIR"
+
+PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m certumalink_importer import-zips \
+  --zip-file "$ZIP_FILE" \
+  --out "$OUT_FILE" \
+  "$@"
+
+PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m certumalink_importer validate-export "$OUT_FILE"
+
