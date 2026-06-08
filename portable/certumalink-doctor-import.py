@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping
+from typing import Callable, Iterable, Iterator, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -189,24 +189,31 @@ def import_zip_codes(
     fixture_path: Path | None = None,
     max_pages_per_zip: int | None = None,
     stats: ImportStats,
+    progress: Callable[[str], None] | None = None,
 ) -> list[DoctorRecord]:
     fetched_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     records_by_npi: "OrderedDict[str, DoctorRecord]" = OrderedDict()
 
-    for raw_zip in zip_codes:
+    for zip_index, raw_zip in enumerate(zip_codes, start=1):
         zip_code = normalize_zip_code(raw_zip)
+        _progress(progress, f"[{zip_index}/{stats.zip_count}] Starting ZIP {zip_code}")
         responses: Iterable[Mapping[str, object]]
         if fixture_path is None:
             responses = client.iter_zip_search(zip_code)
         else:
+            _progress(progress, f"[{zip_index}/{stats.zip_count}] Loading fixture data for {zip_code}")
             responses = [_load_fixture(fixture_path)]
 
-        for response in _limit_pages(responses, max_pages_per_zip):
+        for page_index, response in enumerate(_limit_pages(responses, max_pages_per_zip), start=1):
             stats.response_pages += 1
             results = response.get("results", [])
             if not isinstance(results, list):
+                _progress(progress, f"[{zip_code}] Page {page_index}: skipped malformed response")
                 continue
             stats.source_records += len(results)
+            before_imported = stats.imported_records
+            before_skipped = stats.skipped_records
+            before_duplicates = stats.duplicate_npis
             for result in results:
                 if not isinstance(result, Mapping):
                     stats.skipped_records += 1
@@ -222,6 +229,19 @@ def import_zip_codes(
                 else:
                     existing.add_matched_zip(zip_code)
                     stats.duplicate_npis += 1
+            _progress(
+                progress,
+                (
+                    f"[{zip_code}] Page {page_index}: scanned {len(results)} CMS records, "
+                    f"added {stats.imported_records - before_imported}, "
+                    f"skipped {stats.skipped_records - before_skipped}, "
+                    f"duplicates {stats.duplicate_npis - before_duplicates}"
+                ),
+            )
+        _progress(
+            progress,
+            f"[{zip_index}/{stats.zip_count}] Finished ZIP {zip_code}: {stats.imported_records} physicians so far",
+        )
 
     return list(records_by_npi.values())
 
@@ -389,6 +409,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print machine-readable JSON import summary to stderr.",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress messages. The final report still prints.",
+    )
     return parser
 
 
@@ -418,6 +443,12 @@ def main(argv: list[str] | None = None) -> int:
 
         max_pages = _max_pages(args.max_pages)
         out_path = Path(args.out) if args.out else _default_out_path(zip_codes, args.format)
+        progress = None if args.quiet else _print_progress
+        _progress(progress, "Preparing CMS NPPES physician import")
+        _progress(progress, f"ZIPs queued: {len(zip_codes)}")
+        if max_pages is not None:
+            _progress(progress, f"Page limit: {max_pages} page(s) per ZIP")
+        _progress(progress, f"Output will be written to: {out_path}")
         stats = ImportStats(zip_count=len(zip_codes))
         records = import_zip_codes(
             zip_codes,
@@ -425,9 +456,13 @@ def main(argv: list[str] | None = None) -> int:
             fixture_path=Path(args.fixture) if args.fixture else None,
             max_pages_per_zip=max_pages,
             stats=stats,
+            progress=progress,
         )
+        _progress(progress, f"Writing {len(records)} physician records to {out_path}")
         export_records(records, out_path, output_format=args.format)
+        _progress(progress, "Validating export file")
         report = validate_export(out_path)
+        _progress(progress, "Import complete")
 
         if args.json_log:
             payload = stats.to_log_payload()
@@ -496,6 +531,15 @@ def _print_report(
         print(report.summary())
     print()
     print("Review note: NPPES records are public provider-reported data and need review before publishing.")
+
+
+def _print_progress(message: str) -> None:
+    print(f"[certumalink] {message}", flush=True)
+
+
+def _progress(callback: Callable[[str], None] | None, message: str) -> None:
+    if callback is not None:
+        callback(message)
 
 
 def _read_export_rows(path: Path) -> list[dict[str, object]]:

@@ -22,6 +22,9 @@ The command prompts for a ZIP code, imports live CMS NPPES physician records,
 creates a timestamped CSV in the current folder, validates the output, and
 prints a terminal report.
 
+During longer runs, it prints progress as each ZIP and CMS response page is
+processed, so users can tell the import is still working.
+
 You can also pass the ZIP directly:
 
 ```sh
@@ -44,6 +47,12 @@ Quick live smoke test:
 
 ```sh
 certumalink_run --zip 78701 --max-pages 1
+```
+
+Suppress progress messages and only print the final report:
+
+```sh
+certumalink_run --zip 78701 --quiet
 ```
 
 Example report:

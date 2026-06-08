@@ -51,7 +51,7 @@ certumalink_run --zip
 ```
 
 It will ask for the ZIP code, create a timestamped CSV in the current folder,
-and print a terminal report.
+print progress as CMS pages are processed, and finish with a terminal report.
 
 ## Later Upgrade: GitHub Releases
 
