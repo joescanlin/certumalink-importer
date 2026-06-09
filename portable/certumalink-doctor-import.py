@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -27,10 +28,19 @@ PHYSICIAN_TAXONOMY_PREFIXES = ("207", "208")
 ZIP_RE = re.compile(r"(\d{5})(?:-\d{4})?$")
 NPI_RE = re.compile(r"^\d{10}$")
 ZIP_HEADERS = {"zip", "zipcode", "zip_code", "postal_code", "postalcode"}
-DEFAULT_ACTIVATION_STATUS = "draft_profile_created"
+DEFAULT_ACTIVATION_STATUS = "not_contacted"
+LEGACY_ACTIVATION_STATUS_MAP = {
+    "draft_profile_created": "not_contacted",
+    "rox_contacted": "email_sent",
+    "activated": "physician_activated",
+}
 VALID_ACTIVATION_STATUSES = {
-    "draft_profile_created",
-    "rox_contacted",
+    "not_contacted",
+    "queued_today",
+    "called_no_answer",
+    "voicemail_left",
+    "email_sent",
+    "interested",
     "physician_activated",
     "do_not_contact",
     "needs_review",
@@ -58,6 +68,7 @@ PROFILE_DRAFT_FIELDS = [
     "npi",
     "profile_url",
     "profile_slug",
+    "claim_url",
     "display_name",
     "first_name",
     "last_name",
@@ -70,18 +81,46 @@ PROFILE_DRAFT_FIELDS = [
     "practice_phone",
     "source",
     "source_fetched_at",
+    "campaign",
     "activation_status",
+    "activation_priority",
+    "activation_score",
+    "priority_reason",
+    "profile_completeness_score",
+    "missing_profile_fields",
+    "practice_group_id",
+    "practice_group_size",
+    "other_doctors_at_location",
 ]
 ROX_OUTREACH_FIELDS = [
     "npi",
     "doctor_name",
+    "campaign",
     "specialty",
     "practice_phone",
     "city",
     "state",
     "profile_url",
+    "claim_url",
     "activation_status",
+    "activation_priority",
+    "activation_score",
+    "priority_reason",
+    "profile_completeness_score",
+    "missing_profile_fields",
+    "practice_group_id",
+    "practice_group_size",
+    "other_doctors_at_location",
     "suggested_pitch",
+    "call_opener_draft",
+    "voicemail_draft",
+    "email_subject_draft",
+    "email_body_draft",
+    "follow_up_draft",
+]
+ROX_TODAY_FIELDS = [
+    "queue_rank",
+    *ROX_OUTREACH_FIELDS,
 ]
 ACTIVATION_STATUS_FIELDS = [
     "npi",
@@ -92,7 +131,20 @@ ACTIVATION_STATUS_FIELDS = [
     "practice_zip",
     "last_seen_at",
 ]
+PRACTICE_GROUP_FIELDS = [
+    "practice_group_id",
+    "practice_group_size",
+    "practice_phone",
+    "practice_address_1",
+    "practice_address_2",
+    "practice_city",
+    "practice_state",
+    "practice_zip",
+    "doctors",
+    "npi_list",
+]
 PROMPT_FOR_ZIP = "__PROMPT_FOR_ZIP__"
+QUEUE_EXCLUDED_STATUSES = {"physician_activated", "do_not_contact", "needs_review"}
 
 
 @dataclass
@@ -193,10 +245,85 @@ class OutputBundle:
     doctors_path: Path
     profile_drafts_path: Path | None = None
     rox_outreach_path: Path | None = None
+    rox_today_path: Path | None = None
+    practice_groups_path: Path | None = None
     publish_payload_path: Path | None = None
     publish_result_path: Path | None = None
     activation_status_path: Path | None = None
     summary_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class CampaignPreset:
+    name: str
+    label: str
+    specialty_terms: tuple[str, ...]
+    priority_boost: int
+    pitch_angle: str
+
+
+@dataclass
+class PracticeGroup:
+    group_id: str
+    records: list[DoctorRecord]
+
+    @property
+    def size(self) -> int:
+        return len(self.records)
+
+
+@dataclass(frozen=True)
+class WorkflowFields:
+    campaign: str
+    activation_priority: str
+    activation_score: int
+    priority_reason: str
+    profile_completeness_score: int
+    missing_profile_fields: str
+    practice_group_id: str
+    practice_group_size: int
+    other_doctors_at_location: str
+
+
+CAMPAIGN_PRESETS = {
+    "primary-care": CampaignPreset(
+        name="primary-care",
+        label="Primary Care",
+        specialty_terms=(
+            "family medicine",
+            "internal medicine",
+            "general practice",
+            "pediatrics",
+            "207q00000x",
+            "207r00000x",
+            "208000000x",
+            "208d00000x",
+        ),
+        priority_boost=18,
+        pitch_angle="primary care practice",
+    ),
+    "dermatology": CampaignPreset(
+        name="dermatology",
+        label="Dermatology",
+        specialty_terms=("dermatology", "207n00000x"),
+        priority_boost=22,
+        pitch_angle="dermatology practice",
+    ),
+    "cardiology": CampaignPreset(
+        name="cardiology",
+        label="Cardiology",
+        specialty_terms=("cardiology", "cardiovascular disease", "207rc0000x"),
+        priority_boost=22,
+        pitch_angle="cardiology practice",
+    ),
+    "urgent-care": CampaignPreset(
+        name="urgent-care",
+        label="Urgent Care",
+        specialty_terms=("urgent care", "emergency medicine", "family medicine", "207p00000x", "207q00000x"),
+        priority_boost=18,
+        pitch_angle="urgent care practice",
+    ),
+}
 
 
 class NppesClient:
@@ -513,6 +640,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Filter physicians by specialty text, e.g. dermatology. Can be repeated.",
     )
     parser.add_argument(
+        "--campaign",
+        choices=sorted(CAMPAIGN_PRESETS),
+        default=None,
+        help="Use a built-in Rox campaign preset for targeting, scoring, and outreach drafts.",
+    )
+    parser.add_argument(
         "--publish-dry-run",
         action="store_true",
         help="Generate future Certumalink publish payloads. Default output bundles already include this.",
@@ -575,7 +708,9 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("no valid ZIP codes found")
 
         max_pages = _max_pages(args.max_pages)
+        campaign = _campaign_for_name(args.campaign)
         specialty_filters = _normalize_specialty_filters(args.specialty)
+        import_filters = _combined_specialty_filters(specialty_filters, campaign)
         bundle = _resolve_output_bundle(
             zip_codes,
             out_value=args.out,
@@ -585,8 +720,10 @@ def main(argv: list[str] | None = None) -> int:
         progress = None if args.quiet else _print_progress
         _progress(progress, "Preparing CMS NPPES physician import")
         _progress(progress, f"ZIPs queued: {len(zip_codes)}")
-        if specialty_filters:
-            _progress(progress, f"Specialty filter: {', '.join(specialty_filters)}")
+        if campaign is not None:
+            _progress(progress, f"Campaign: {campaign.label}")
+        if import_filters:
+            _progress(progress, f"Specialty filter: {', '.join(import_filters)}")
         if max_pages is not None:
             _progress(progress, f"Page limit: {max_pages} page(s) per ZIP")
         _progress(progress, f"Output will be written to: {bundle.output_dir}")
@@ -596,7 +733,7 @@ def main(argv: list[str] | None = None) -> int:
             client=NppesClient(),
             fixture_path=Path(args.fixture) if args.fixture else None,
             max_pages_per_zip=max_pages,
-            specialty_filters=specialty_filters,
+            specialty_filters=import_filters,
             stats=stats,
             progress=progress,
         )
@@ -611,7 +748,8 @@ def main(argv: list[str] | None = None) -> int:
             records,
             stats=stats,
             zip_codes=zip_codes,
-            specialty_filters=specialty_filters,
+            specialty_filters=import_filters,
+            campaign=campaign,
             status_ledger_path=Path(args.status_ledger) if args.status_ledger else None,
             publish_dry_run=args.publish_dry_run or bundle.bundle_mode,
             publish_to_certumalink=args.publish_to_certumalink,
@@ -634,7 +772,7 @@ def main(argv: list[str] | None = None) -> int:
             zip_codes=zip_codes,
             report=report,
             bundle_outputs=bundle_outputs,
-            specialty_filters=specialty_filters,
+            specialty_filters=import_filters,
         )
         publish_summary = bundle_outputs.get("certumalink_publish")
         publish_failed = (
@@ -679,6 +817,8 @@ def _resolve_output_bundle(
         doctors_path=output_dir / "doctors.csv",
         profile_drafts_path=output_dir / "profile_drafts.csv",
         rox_outreach_path=output_dir / "rox_outreach.csv",
+        rox_today_path=output_dir / "rox_today.csv",
+        practice_groups_path=output_dir / "practice_groups.csv",
         publish_payload_path=output_dir / "publish_payload.json",
         publish_result_path=output_dir / "publish_result.json",
         activation_status_path=output_dir / "activation_status.csv",
@@ -760,6 +900,22 @@ def _normalize_specialty_filters(values: list[str]) -> list[str]:
     return _dedupe(filters)
 
 
+def _campaign_for_name(name: str | None) -> CampaignPreset | None:
+    if name is None:
+        return None
+    return CAMPAIGN_PRESETS[name]
+
+
+def _combined_specialty_filters(
+    specialty_filters: list[str],
+    campaign: CampaignPreset | None,
+) -> list[str]:
+    terms = list(specialty_filters)
+    if campaign is not None:
+        terms.extend(campaign.specialty_terms)
+    return _dedupe(terms)
+
+
 def _matches_specialty(record: DoctorRecord, specialty_filters: list[str] | None) -> bool:
     if not specialty_filters:
         return True
@@ -775,6 +931,7 @@ def _write_bundle_outputs(
     stats: ImportStats,
     zip_codes: list[str],
     specialty_filters: list[str],
+    campaign: CampaignPreset | None,
     status_ledger_path: Path | None,
     publish_dry_run: bool,
     publish_to_certumalink: bool,
@@ -786,6 +943,8 @@ def _write_bundle_outputs(
             "doctors_path": str(bundle.doctors_path),
             "profile_drafts": 0,
             "rox_outreach": 0,
+            "rox_today": 0,
+            "practice_groups": 0,
             "publish_payloads": 0,
             "status_counts": {},
             "paths": {"doctors": str(bundle.doctors_path)},
@@ -794,17 +953,71 @@ def _write_bundle_outputs(
     existing_statuses = _read_status_ledger(status_ledger_path)
     status_rows = _build_activation_status_rows(records, existing_statuses)
     status_by_npi = {row["npi"]: row["activation_status"] for row in status_rows}
-    profile_rows = [_profile_draft_row(record, status_by_npi[record.npi]) for record in records]
-    rox_rows = [_rox_outreach_row(record, status_by_npi[record.npi]) for record in records]
-    publish_payload = _publish_payload(records, status_by_npi) if publish_dry_run else {
+    practice_groups = _build_practice_groups(records)
+    group_by_npi = _group_by_npi(practice_groups)
+    workflow_by_npi = {
+        record.npi: _workflow_fields(
+            record,
+            activation_status=status_by_npi[record.npi],
+            campaign=campaign,
+            practice_group=group_by_npi[record.npi],
+        )
+        for record in records
+    }
+    publish_payload = _publish_payload(
+        records,
+        status_by_npi,
+        campaign=campaign,
+        workflow_by_npi=workflow_by_npi,
+    ) if publish_dry_run else {
         "dry_run": True,
         "profiles": [],
     }
+
+    publish_result: dict[str, object] | None = None
+    if publish_to_certumalink:
+        _progress(progress, "Publishing draft profiles to Certumalink")
+        publish_result = _publish_to_certumalink(
+            _publish_payload(
+                records,
+                status_by_npi,
+                campaign=campaign,
+                workflow_by_npi=workflow_by_npi,
+                dry_run=False,
+            )
+        )
+
+    claim_urls_by_npi = _claim_urls_by_npi(publish_result)
+    profile_rows = [
+        _profile_draft_row(
+            record,
+            status_by_npi[record.npi],
+            workflow_by_npi[record.npi],
+            claim_urls_by_npi.get(record.npi, ""),
+        )
+        for record in records
+    ]
+    rox_rows = [
+        _rox_outreach_row(
+            record,
+            status_by_npi[record.npi],
+            workflow_by_npi[record.npi],
+            claim_urls_by_npi.get(record.npi, ""),
+            campaign,
+        )
+        for record in records
+    ]
+    rox_today_rows = _rox_today_rows(rox_rows)
+    practice_group_rows = _practice_group_rows(practice_groups)
 
     _progress(progress, f"Writing profile drafts to {bundle.profile_drafts_path}")
     _write_csv(profile_rows, PROFILE_DRAFT_FIELDS, bundle.profile_drafts_path)
     _progress(progress, f"Writing Rox outreach CSV to {bundle.rox_outreach_path}")
     _write_csv(rox_rows, ROX_OUTREACH_FIELDS, bundle.rox_outreach_path)
+    _progress(progress, f"Writing Rox daily queue to {bundle.rox_today_path}")
+    _write_csv(rox_today_rows, ROX_TODAY_FIELDS, bundle.rox_today_path)
+    _progress(progress, f"Writing practice groups to {bundle.practice_groups_path}")
+    _write_csv(practice_group_rows, PRACTICE_GROUP_FIELDS, bundle.practice_groups_path)
     _progress(progress, f"Writing activation status ledger to {bundle.activation_status_path}")
     _write_csv(status_rows, ACTIVATION_STATUS_FIELDS, bundle.activation_status_path)
 
@@ -815,28 +1028,33 @@ def _write_bundle_outputs(
     _progress(progress, f"Writing publish dry-run payload to {bundle.publish_payload_path}")
     _write_json(publish_payload, bundle.publish_payload_path)
 
-    publish_result: dict[str, object] | None = None
     if publish_to_certumalink:
-        _progress(progress, "Publishing draft profiles to Certumalink")
-        publish_result = _publish_to_certumalink(_publish_payload(records, status_by_npi, dry_run=False))
         _progress(progress, f"Writing Certumalink publish result to {bundle.publish_result_path}")
         _write_json(publish_result, bundle.publish_result_path)
 
     status_counts = _status_counts(status_rows)
+    priority_counts = _priority_counts(workflow_by_npi.values())
     summary = {
         "bundle_mode": True,
         "zip_codes": zip_codes,
+        "campaign": campaign.name if campaign is not None else "",
         "specialty_filters": specialty_filters,
         "stats": stats.to_log_payload(),
         "profile_drafts": len(profile_rows),
         "rox_outreach": len(rox_rows),
+        "rox_today": len(rox_today_rows),
+        "practice_groups": len(practice_group_rows),
         "publish_payloads": len(publish_payload.get("profiles", [])),
         "certumalink_publish": _publish_summary(publish_result),
         "status_counts": status_counts,
+        "priority_counts": priority_counts,
+        "average_profile_completeness": _average_profile_completeness(workflow_by_npi.values()),
         "paths": {
             "doctors": str(bundle.doctors_path),
             "profile_drafts": str(bundle.profile_drafts_path),
             "rox_outreach": str(bundle.rox_outreach_path),
+            "rox_today": str(bundle.rox_today_path),
+            "practice_groups": str(bundle.practice_groups_path),
             "publish_payload": str(bundle.publish_payload_path),
             "publish_result": str(bundle.publish_result_path) if publish_result is not None else "",
             "activation_status": str(bundle.activation_status_path),
@@ -848,12 +1066,18 @@ def _write_bundle_outputs(
     return summary
 
 
-def _profile_draft_row(record: DoctorRecord, activation_status: str) -> dict[str, str]:
+def _profile_draft_row(
+    record: DoctorRecord,
+    activation_status: str,
+    workflow: WorkflowFields,
+    claim_url: str = "",
+) -> dict[str, str]:
     slug = _profile_slug(record)
     return {
         "npi": record.npi,
         "profile_url": _profile_url(record),
         "profile_slug": slug,
+        "claim_url": claim_url,
         "display_name": record.display_name,
         "first_name": record.first_name,
         "last_name": record.last_name,
@@ -866,21 +1090,52 @@ def _profile_draft_row(record: DoctorRecord, activation_status: str) -> dict[str
         "practice_phone": record.practice_phone,
         "source": record.source,
         "source_fetched_at": record.source_fetched_at,
+        "campaign": workflow.campaign,
         "activation_status": activation_status,
+        "activation_priority": workflow.activation_priority,
+        "activation_score": str(workflow.activation_score),
+        "priority_reason": workflow.priority_reason,
+        "profile_completeness_score": str(workflow.profile_completeness_score),
+        "missing_profile_fields": workflow.missing_profile_fields,
+        "practice_group_id": workflow.practice_group_id,
+        "practice_group_size": str(workflow.practice_group_size),
+        "other_doctors_at_location": workflow.other_doctors_at_location,
     }
 
 
-def _rox_outreach_row(record: DoctorRecord, activation_status: str) -> dict[str, str]:
+def _rox_outreach_row(
+    record: DoctorRecord,
+    activation_status: str,
+    workflow: WorkflowFields,
+    claim_url: str,
+    campaign: CampaignPreset | None,
+) -> dict[str, str]:
+    drafts = _rox_editable_drafts(record, campaign, claim_url)
     return {
         "npi": record.npi,
         "doctor_name": record.display_name,
+        "campaign": workflow.campaign,
         "specialty": record.primary_specialty,
         "practice_phone": record.practice_phone,
         "city": record.practice_city,
         "state": record.practice_state,
         "profile_url": _profile_url(record),
+        "claim_url": claim_url,
         "activation_status": activation_status,
+        "activation_priority": workflow.activation_priority,
+        "activation_score": str(workflow.activation_score),
+        "priority_reason": workflow.priority_reason,
+        "profile_completeness_score": str(workflow.profile_completeness_score),
+        "missing_profile_fields": workflow.missing_profile_fields,
+        "practice_group_id": workflow.practice_group_id,
+        "practice_group_size": str(workflow.practice_group_size),
+        "other_doctors_at_location": workflow.other_doctors_at_location,
         "suggested_pitch": _suggested_pitch(record),
+        "call_opener_draft": drafts["call_opener_draft"],
+        "voicemail_draft": drafts["voicemail_draft"],
+        "email_subject_draft": drafts["email_subject_draft"],
+        "email_body_draft": drafts["email_body_draft"],
+        "follow_up_draft": drafts["follow_up_draft"],
     }
 
 
@@ -888,13 +1143,31 @@ def _publish_payload(
     records: list[DoctorRecord],
     status_by_npi: dict[str, str],
     *,
+    campaign: CampaignPreset | None = None,
+    workflow_by_npi: dict[str, WorkflowFields] | None = None,
     dry_run: bool = True,
 ) -> dict[str, object]:
+    if workflow_by_npi is None:
+        practice_groups = _build_practice_groups(records)
+        group_by_npi = _group_by_npi(practice_groups)
+        workflow_by_npi = {
+            record.npi: _workflow_fields(
+                record,
+                activation_status=status_by_npi[record.npi],
+                campaign=campaign,
+                practice_group=group_by_npi[record.npi],
+            )
+            for record in records
+        }
     return {
         "dry_run": dry_run,
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "source": SOURCE,
-        "profiles": [_profile_draft_row(record, status_by_npi[record.npi]) for record in records],
+        "campaign": campaign.name if campaign is not None else "",
+        "profiles": [
+            _profile_draft_row(record, status_by_npi[record.npi], workflow_by_npi[record.npi])
+            for record in records
+        ],
     }
 
 
@@ -959,9 +1232,220 @@ def _publish_summary(publish_result: dict[str, object] | None) -> dict[str, obje
         "import_id": response_map.get("import_id") or response_map.get("id") or "",
         "created": response_map.get("created_count", 0),
         "updated": response_map.get("updated_count", 0),
+        "unchanged": response_map.get("unchanged_count", 0),
         "skipped": response_map.get("skipped_count", 0),
         "errors": response_map.get("error_count", 0),
+        "claim_links": len(_claim_urls_by_npi(publish_result)),
     }
+
+
+def _claim_urls_by_npi(publish_result: dict[str, object] | None) -> dict[str, str]:
+    if publish_result is None:
+        return {}
+    response = publish_result.get("response")
+    if not isinstance(response, Mapping):
+        return {}
+    results = response.get("results", [])
+    if not isinstance(results, list):
+        return {}
+    claim_urls: dict[str, str] = {}
+    for item in results:
+        if not isinstance(item, Mapping):
+            continue
+        npi = _clean(item.get("npi"))
+        claim_url = _clean(item.get("claim_url"))
+        if npi and claim_url:
+            claim_urls[npi] = claim_url
+    return claim_urls
+
+
+def _build_practice_groups(records: list[DoctorRecord]) -> list[PracticeGroup]:
+    groups_by_key: "OrderedDict[str, PracticeGroup]" = OrderedDict()
+    for record in records:
+        key = _practice_group_key(record)
+        group = groups_by_key.get(key)
+        if group is None:
+            group = PracticeGroup(group_id=_practice_group_id(key), records=[])
+            groups_by_key[key] = group
+        group.records.append(record)
+    return list(groups_by_key.values())
+
+
+def _group_by_npi(practice_groups: list[PracticeGroup]) -> dict[str, PracticeGroup]:
+    groups: dict[str, PracticeGroup] = {}
+    for group in practice_groups:
+        for record in group.records:
+            groups[record.npi] = group
+    return groups
+
+
+def _practice_group_key(record: DoctorRecord) -> str:
+    phone = _digits_only(record.practice_phone)
+    address_parts = [
+        record.practice_address_1,
+        record.practice_address_2,
+        record.practice_city,
+        record.practice_state,
+        record.practice_zip,
+    ]
+    address = "|".join(_clean(part).lower() for part in address_parts)
+    return f"{phone}|{address}" if phone or address.strip("|") else record.npi
+
+
+def _practice_group_id(key: str) -> str:
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+    return f"practice-{digest}"
+
+
+def _practice_group_rows(practice_groups: list[PracticeGroup]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for group in sorted(practice_groups, key=lambda item: (-item.size, item.group_id)):
+        first = group.records[0]
+        rows.append(
+            {
+                "practice_group_id": group.group_id,
+                "practice_group_size": str(group.size),
+                "practice_phone": first.practice_phone,
+                "practice_address_1": first.practice_address_1,
+                "practice_address_2": first.practice_address_2,
+                "practice_city": first.practice_city,
+                "practice_state": first.practice_state,
+                "practice_zip": first.practice_zip,
+                "doctors": " | ".join(record.display_name for record in group.records),
+                "npi_list": ",".join(record.npi for record in group.records),
+            }
+        )
+    return rows
+
+
+def _workflow_fields(
+    record: DoctorRecord,
+    *,
+    activation_status: str,
+    campaign: CampaignPreset | None,
+    practice_group: PracticeGroup,
+) -> WorkflowFields:
+    completeness_score, missing_fields = _profile_completeness(record)
+    score = 0
+    reasons: list[str] = []
+
+    if record.practice_phone:
+        score += 25
+        reasons.append("has practice phone")
+    else:
+        reasons.append("missing practice phone")
+    if record.first_name and record.last_name:
+        score += 10
+    if record.primary_specialty and record.primary_taxonomy_code:
+        score += 15
+    if record.practice_address_1 and record.practice_city and record.practice_state and record.practice_zip:
+        score += 15
+    if campaign is not None and _matches_specialty(record, list(campaign.specialty_terms)):
+        score += campaign.priority_boost
+        reasons.append(f"matches {campaign.label} campaign")
+    if practice_group.size > 1:
+        score += 5
+        reasons.append(f"shared practice with {practice_group.size} doctors")
+    if activation_status in ("not_contacted", "queued_today"):
+        score += 5
+        reasons.append("not contacted yet")
+    if completeness_score >= 90:
+        score += 10
+    elif completeness_score < 70:
+        score -= 10
+
+    if activation_status == "do_not_contact":
+        priority = "low"
+        reason = "status is do_not_contact"
+    elif activation_status == "physician_activated":
+        priority = "low"
+        reason = "already activated"
+    elif activation_status == "needs_review" or completeness_score < 70:
+        priority = "low"
+        reason = f"needs review: missing {', '.join(missing_fields) or 'profile data'}"
+    elif score >= 75:
+        priority = "high"
+        reason = "; ".join(reasons[:3]) or "high activation fit"
+    elif score >= 50:
+        priority = "medium"
+        reason = "; ".join(reasons[:3]) or "moderate activation fit"
+    else:
+        priority = "low"
+        reason = "; ".join(reasons[:3]) or "low activation fit"
+
+    other_doctors = [
+        other.display_name
+        for other in practice_group.records
+        if other.npi != record.npi
+    ]
+    return WorkflowFields(
+        campaign=campaign.name if campaign is not None else "",
+        activation_priority=priority,
+        activation_score=max(score, 0),
+        priority_reason=reason,
+        profile_completeness_score=completeness_score,
+        missing_profile_fields=",".join(missing_fields),
+        practice_group_id=practice_group.group_id,
+        practice_group_size=practice_group.size,
+        other_doctors_at_location=" | ".join(other_doctors),
+    )
+
+
+def _profile_completeness(record: DoctorRecord) -> tuple[int, list[str]]:
+    fields = [
+        ("first_name", record.first_name),
+        ("last_name", record.last_name),
+        ("specialty", record.primary_specialty),
+        ("taxonomy_code", record.primary_taxonomy_code),
+        ("practice_address_1", record.practice_address_1),
+        ("practice_city", record.practice_city),
+        ("practice_state", record.practice_state),
+        ("practice_zip", record.practice_zip),
+        ("practice_phone", record.practice_phone),
+    ]
+    missing = [name for name, value in fields if not _clean(value)]
+    present = len(fields) - len(missing)
+    return round((present / len(fields)) * 100), missing
+
+
+def _rox_today_rows(rox_rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    eligible = [
+        row for row in rox_rows
+        if row["activation_status"] not in QUEUE_EXCLUDED_STATUSES
+        and row["activation_priority"] != "low"
+    ]
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    sorted_rows = sorted(
+        eligible,
+        key=lambda row: (
+            priority_rank.get(row["activation_priority"], 9),
+            -int(row["activation_score"] or "0"),
+            row["doctor_name"],
+            row["npi"],
+        ),
+    )
+    return [
+        {"queue_rank": str(index), **row}
+        for index, row in enumerate(sorted_rows, start=1)
+    ]
+
+
+def _priority_counts(workflows: Iterable[WorkflowFields]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for workflow in workflows:
+        counts[workflow.activation_priority] = counts.get(workflow.activation_priority, 0) + 1
+    return counts
+
+
+def _average_profile_completeness(workflows: Iterable[WorkflowFields]) -> int:
+    values = [workflow.profile_completeness_score for workflow in workflows]
+    if not values:
+        return 0
+    return round(sum(values) / len(values))
+
+
+def _digits_only(value: str) -> str:
+    return re.sub(r"\D+", "", value)
 
 
 def _build_activation_status_rows(
@@ -972,7 +1456,7 @@ def _build_activation_status_rows(
     rows: list[dict[str, str]] = []
     for record in records:
         existing = existing_statuses.get(record.npi, {})
-        activation_status = existing.get("activation_status") or DEFAULT_ACTIVATION_STATUS
+        activation_status = _normalize_activation_status(existing.get("activation_status", ""))
         if activation_status not in VALID_ACTIVATION_STATUSES:
             raise ValueError(f"invalid activation status for NPI {record.npi}: {activation_status}")
         rows.append(
@@ -1007,7 +1491,7 @@ def _read_status_ledger(path: Path | None) -> dict[str, dict[str, str]]:
     statuses: dict[str, dict[str, str]] = {}
     for row in rows:
         npi = str(row.get("npi", "")).strip()
-        status = str(row.get("activation_status", "")).strip()
+        status = _normalize_activation_status(str(row.get("activation_status", "")).strip())
         if not npi:
             continue
         if status and status not in VALID_ACTIVATION_STATUSES:
@@ -1022,6 +1506,13 @@ def _read_status_ledger(path: Path | None) -> dict[str, dict[str, str]]:
             "last_seen_at": str(row.get("last_seen_at", "")).strip(),
         }
     return statuses
+
+
+def _normalize_activation_status(status: str) -> str:
+    cleaned = str(status or "").strip()
+    if not cleaned:
+        return DEFAULT_ACTIVATION_STATUS
+    return LEGACY_ACTIVATION_STATUS_MAP.get(cleaned, cleaned)
 
 
 def _status_counts(rows: list[dict[str, str]]) -> dict[str, int]:
@@ -1056,6 +1547,39 @@ def _suggested_pitch(record: DoctorRecord) -> str:
         f"Dr. {last_name}, Certumalink has prepared a profile for your "
         f"{specialty} practice in {city}. We can help you activate and review it."
     )
+
+
+def _rox_editable_drafts(
+    record: DoctorRecord,
+    campaign: CampaignPreset | None,
+    claim_url: str,
+) -> dict[str, str]:
+    last_name = record.last_name or record.display_name
+    specialty = campaign.pitch_angle if campaign is not None else (record.primary_specialty or "medical practice")
+    city = record.practice_city or "your area"
+    activation_target = claim_url or _profile_url(record)
+    return {
+        "call_opener_draft": (
+            f"Hi Dr. {last_name}, this is Rox calling with Certumalink. "
+            f"We prepared a draft profile for your {specialty} in {city} and wanted to help you review it."
+        ),
+        "voicemail_draft": (
+            f"Hi Dr. {last_name}, this is Rox with Certumalink. "
+            "We prepared a draft physician profile for you and can help activate it when you are ready."
+        ),
+        "email_subject_draft": "Your Certumalink physician profile is ready for review",
+        "email_body_draft": (
+            f"Hi Dr. {last_name},\n\n"
+            f"Certumalink prepared a draft profile for your {specialty} in {city}. "
+            "You can review the profile details and decide whether to activate it for patients.\n\n"
+            f"Review link: {activation_target}\n\n"
+            "Rox can help update the profile if anything needs to change."
+        ),
+        "follow_up_draft": (
+            f"Hi Dr. {last_name}, following up on the Certumalink profile we prepared. "
+            f"When convenient, you can review it here: {activation_target}"
+        ),
+    }
 
 
 def _write_csv(rows: list[dict[str, str]], fieldnames: list[str], path: Path | None) -> None:
@@ -1095,6 +1619,9 @@ def _print_report(
     print("Certumalink Doctor Import Report")
     print("--------------------------------")
     print(f"ZIPs: {shown_zips}")
+    campaign = bundle_outputs.get("campaign")
+    if campaign:
+        print(f"Campaign: {campaign}")
     if specialty_filters:
         print(f"Specialty filter: {', '.join(specialty_filters)}")
     print(f"Output: {out_path}")
@@ -1112,6 +1639,14 @@ def _print_report(
     if bundle_outputs.get("bundle_mode"):
         print(f"Profile drafts created: {bundle_outputs.get('profile_drafts', 0)}")
         print(f"Rox outreach rows created: {bundle_outputs.get('rox_outreach', 0)}")
+        print(f"Rox daily queue rows: {bundle_outputs.get('rox_today', 0)}")
+        print(f"Practice groups: {bundle_outputs.get('practice_groups', 0)}")
+        print(f"Average profile completeness: {bundle_outputs.get('average_profile_completeness', 0)}")
+        priority_counts = bundle_outputs.get("priority_counts") or {}
+        if isinstance(priority_counts, Mapping) and priority_counts:
+            print("Activation priorities:")
+            for priority, count in sorted(priority_counts.items()):
+                print(f"  - {priority}: {count}")
         print(f"Publish dry-run payloads: {bundle_outputs.get('publish_payloads', 0)}")
         publish_summary = bundle_outputs.get("certumalink_publish")
         if isinstance(publish_summary, Mapping) and publish_summary.get("attempted"):
@@ -1126,9 +1661,11 @@ def _print_report(
                 "Certumalink results: "
                 f"created {publish_summary.get('created', 0)}, "
                 f"updated {publish_summary.get('updated', 0)}, "
+                f"unchanged {publish_summary.get('unchanged', 0)}, "
                 f"skipped {publish_summary.get('skipped', 0)}, "
                 f"errors {publish_summary.get('errors', 0)}"
             )
+            print(f"Certumalink claim links returned: {publish_summary.get('claim_links', 0)}")
         status_counts = bundle_outputs.get("status_counts") or {}
         if isinstance(status_counts, Mapping) and status_counts:
             print("Activation statuses:")

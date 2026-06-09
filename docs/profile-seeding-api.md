@@ -28,6 +28,7 @@ CERTUMALINK_API_URL=https://www.certumalink.com
       "npi": "1497507156",
       "profile_url": "https://www.certumalink.com/doctors/mohamad-abouelnaaj-1497507156",
       "profile_slug": "mohamad-abouelnaaj-1497507156",
+      "claim_url": "",
       "display_name": "MOHAMAD KHALED ABOUELNAAJ",
       "first_name": "MOHAMAD",
       "last_name": "ABOUELNAAJ",
@@ -40,7 +41,16 @@ CERTUMALINK_API_URL=https://www.certumalink.com
       "practice_phone": "512-324-7000",
       "source": "cms_nppes_registry_api",
       "source_fetched_at": "2026-06-09T16:34:36+00:00",
-      "activation_status": "draft_profile_created"
+      "campaign": "primary-care",
+      "activation_status": "not_contacted",
+      "activation_priority": "high",
+      "activation_score": "88",
+      "priority_reason": "has practice phone; matches Primary Care campaign; not contacted yet",
+      "profile_completeness_score": "100",
+      "missing_profile_fields": "",
+      "practice_group_id": "practice-abc123",
+      "practice_group_size": "3",
+      "other_doctors_at_location": "JANE SMITH, MD | ROBERT LEE, DO"
     }
   ]
 }
@@ -53,6 +63,7 @@ CERTUMALINK_API_URL=https://www.certumalink.com
 - Preserve human-reviewed or activated profile edits on re-import.
 - Store source metadata: `source`, `source_fetched_at`, `last_imported_at`, and import batch ID.
 - Return per-NPI results so the importer can write `publish_result.json`.
+- If the platform creates profile claim links, return `claim_url` per NPI so Rox can use direct activation links.
 
 ## Lifecycle
 
@@ -70,11 +81,23 @@ do_not_contact
 Importer activation statuses map into the platform like this:
 
 ```text
-draft_profile_created -> draft
-rox_contacted -> rox_contacted
+not_contacted -> ready_for_rox
+queued_today -> ready_for_rox
+called_no_answer -> rox_contacted
+voicemail_left -> rox_contacted
+email_sent -> rox_contacted
+interested -> rox_contacted
 physician_activated -> activated
 do_not_contact -> do_not_contact
 needs_review -> needs_review
+```
+
+Legacy importer statuses may still appear in older files and should be treated
+as:
+
+```text
+draft_profile_created -> not_contacted
+rox_contacted -> email_sent
 ```
 
 ## Response
@@ -94,7 +117,8 @@ Successful response:
       "npi": "1497507156",
       "action": "created",
       "profile_id": "prof_123",
-      "profile_url": "https://www.certumalink.com/doctors/mohamad-abouelnaaj-1497507156"
+      "profile_url": "https://www.certumalink.com/doctors/mohamad-abouelnaaj-1497507156",
+      "claim_url": "https://www.certumalink.com/claim/abc123"
     }
   ]
 }
@@ -130,6 +154,7 @@ The platform should validate:
 - required fields are present: `npi`, `profile_slug`, `display_name`, `specialty`, `taxonomy_code`, `source`.
 - lifecycle/status values are allowed.
 - imported profile defaults to private visibility.
+- workflow fields such as `activation_priority`, `activation_score`, `campaign`, and `practice_group_id` may be stored as import metadata.
 
 ## Importer Output
 
@@ -142,3 +167,6 @@ summary.json
 
 If the API returns a non-2xx response, `publish_result.json` is still written and the command exits non-zero.
 
+If the API returns per-NPI `claim_url` values, the importer writes those into
+`profile_drafts.csv`, `rox_outreach.csv`, `rox_today.csv`, `publish_result.json`,
+and `summary.json`.

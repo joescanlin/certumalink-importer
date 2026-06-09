@@ -46,6 +46,13 @@ Filter to one specialty:
 certumalink_run --zip 78701 --specialty dermatology
 ```
 
+Run a built-in Rox campaign preset:
+
+```sh
+certumalink_run --zip 78701 --campaign primary-care
+certumalink_run --zip 78701 --campaign dermatology
+```
+
 For a ZIP list:
 
 ```sh
@@ -91,12 +98,33 @@ The expected backend endpoint contract is documented in `docs/profile-seeding-ap
 The default output folder contains:
 
 - `doctors.csv` - normalized CMS physician export
-- `profile_drafts.csv` - Certumalink draft profile rows with deterministic profile URLs
-- `rox_outreach.csv` - Rox-ready activation outreach rows with suggested pitch text
+- `profile_drafts.csv` - Certumalink draft profile rows with deterministic profile URLs, priority, completeness, and grouping fields
+- `rox_outreach.csv` - Rox-ready activation outreach rows with editable draft call/email copy
+- `rox_today.csv` - prioritized daily Rox work queue, sorted by activation priority and score
+- `practice_groups.csv` - doctors grouped by shared practice phone/address so Rox can work offices efficiently
 - `publish_payload.json` - dry-run profile payloads for future Certumalink API publishing
 - `publish_result.json` - present only when `--publish-to-certumalink` is used
-- `activation_status.csv` - local NPI-keyed activation status ledger for this run
+- `activation_status.csv` - local NPI-keyed Rox activation status ledger for this run
 - `summary.json` - machine-readable run summary, skip reasons, and output paths
+
+Built-in campaigns are `primary-care`, `dermatology`, `cardiology`, and
+`urgent-care`. Campaigns add specialty targeting, priority boosts, and
+Rox-editable starter copy. Rox agents should treat the draft outreach text as a
+starting point, not a replacement for their own final messaging.
+
+Activation statuses supported by the local ledger:
+
+```text
+not_contacted
+queued_today
+called_no_answer
+voicemail_left
+email_sent
+interested
+physician_activated
+do_not_contact
+needs_review
+```
 
 Profile URLs use this shape:
 
@@ -127,9 +155,16 @@ Duplicate NPIs merged: 0
 CMS response pages: 1
 Profile drafts created: 32
 Rox outreach rows created: 32
+Rox daily queue rows: 24
+Practice groups: 18
+Average profile completeness: 92
+Activation priorities:
+  - high: 12
+  - medium: 12
+  - low: 8
 Publish dry-run payloads: 32
 Activation statuses:
-  - draft_profile_created: 32
+  - not_contacted: 32
 Validation: passed
 ```
 

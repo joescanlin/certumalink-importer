@@ -65,6 +65,8 @@ The output folder includes:
 - `doctors.csv`
 - `profile_drafts.csv`
 - `rox_outreach.csv`
+- `rox_today.csv`
+- `practice_groups.csv`
 - `publish_payload.json`
 - `activation_status.csv`
 - `summary.json`
@@ -73,9 +75,16 @@ Useful options:
 
 ```sh
 certumalink_run --zip 49506 --specialty dermatology
+certumalink_run --zip 49506 --campaign primary-care
+certumalink_run --zip 49506 --campaign dermatology
 certumalink_run --zip 49506 --status-ledger activation_status.csv
 certumalink_run --zip 49506 --quiet
 ```
+
+Rox should generally start with `rox_today.csv` for the prioritized daily queue
+and use `rox_outreach.csv` for editable starter drafts. The draft call/email
+copy is meant to be edited by Rox agents, not treated as final generated
+messaging.
 
 When the platform API is ready, admins can publish private draft profiles:
 

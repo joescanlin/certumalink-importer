@@ -34,7 +34,18 @@ certumalink_run --update
 ```
 
 It prompts for the ZIP, writes a timestamped output folder, creates profile
-draft and Rox outreach exports, and prints the import report in the terminal.
+drafts, a prioritized Rox queue, editable outreach draft exports, practice
+groups, and prints the import report in the terminal.
+
+For campaign-focused runs:
+
+```sh
+certumalink_run --zip 49506 --campaign primary-care
+certumalink_run --zip 49506 --campaign dermatology
+```
+
+Use `rox_today.csv` for the daily work queue. Use `rox_outreach.csv` for
+editable starter call/email drafts that Rox agents can revise.
 
 ## ZIP File Format
 
@@ -69,6 +80,10 @@ The CSV includes:
 - practice address and phone
 - matched ZIPs
 - CMS source metadata
+
+The hosted output folder also includes activation priority, profile
+completeness, practice grouping, and Rox status data to help decide who to
+contact first.
 
 Only active individual physician records are included. Practice-location ZIP
 must match the requested ZIP. Records that only match through a mailing address

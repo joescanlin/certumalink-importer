@@ -73,6 +73,8 @@ class PortableV2Tests(unittest.TestCase):
                 "doctors.csv",
                 "profile_drafts.csv",
                 "rox_outreach.csv",
+                "rox_today.csv",
+                "practice_groups.csv",
                 "publish_payload.json",
                 "activation_status.csv",
                 "summary.json",
@@ -86,22 +88,158 @@ class PortableV2Tests(unittest.TestCase):
                 profiles[0]["profile_url"],
                 "https://www.certumalink.com/doctors/ada-lovelace-1234567890",
             )
-            self.assertEqual(profiles[0]["activation_status"], "rox_contacted")
+            self.assertEqual(profiles[0]["activation_status"], "email_sent")
+            self.assertEqual(profiles[0]["activation_priority"], "high")
+            self.assertEqual(profiles[1]["activation_priority"], "low")
+            self.assertIn("practice_phone", profiles[1]["missing_profile_fields"])
 
             with (out_dir / "rox_outreach.csv").open("r", newline="", encoding="utf-8") as input_file:
                 rox_rows = list(csv.DictReader(input_file))
             self.assertIn("Certumalink has prepared a profile", rox_rows[0]["suggested_pitch"])
+            self.assertIn("email_body_draft", rox_rows[0])
+            self.assertIn("Review link:", rox_rows[0]["email_body_draft"])
+
+            with (out_dir / "rox_today.csv").open("r", newline="", encoding="utf-8") as input_file:
+                queue_rows = list(csv.DictReader(input_file))
+            self.assertEqual(len(queue_rows), 1)
+            self.assertEqual(queue_rows[0]["queue_rank"], "1")
+            self.assertEqual(queue_rows[0]["activation_priority"], "high")
+
+            with (out_dir / "practice_groups.csv").open("r", newline="", encoding="utf-8") as input_file:
+                practice_groups = list(csv.DictReader(input_file))
+            self.assertEqual(len(practice_groups), 2)
+            self.assertEqual(practice_groups[0]["practice_group_size"], "1")
 
             payload = json.loads((out_dir / "publish_payload.json").read_text(encoding="utf-8"))
             self.assertTrue(payload["dry_run"])
             self.assertEqual(len(payload["profiles"]), 2)
+            self.assertIn("activation_score", payload["profiles"][0])
+            self.assertIn("practice_group_id", payload["profiles"][0])
 
             summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["profile_drafts"], 2)
             self.assertEqual(summary["rox_outreach"], 2)
+            self.assertEqual(summary["rox_today"], 1)
+            self.assertEqual(summary["practice_groups"], 2)
             self.assertEqual(summary["publish_payloads"], 2)
-            self.assertEqual(summary["status_counts"]["rox_contacted"], 1)
-            self.assertEqual(summary["status_counts"]["draft_profile_created"], 1)
+            self.assertEqual(summary["status_counts"]["email_sent"], 1)
+            self.assertEqual(summary["status_counts"]["not_contacted"], 1)
+            self.assertEqual(summary["priority_counts"]["high"], 1)
+            self.assertEqual(summary["priority_counts"]["low"], 1)
+            self.assertEqual(summary["average_profile_completeness"], 94)
+
+            with ledger.open("r", newline="", encoding="utf-8") as input_file:
+                ledger_rows = list(csv.DictReader(input_file))
+            self.assertEqual(ledger_rows[0]["activation_status"], "email_sent")
+
+    def test_campaign_primary_care_outputs_campaign_metadata(self) -> None:
+        module = load_portable_module()
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory) / "bundle"
+            exit_code = module.main(
+                [
+                    "--zip",
+                    "78701",
+                    "--fixture",
+                    str(FIXTURE),
+                    "--out",
+                    str(out_dir),
+                    "--campaign",
+                    "primary-care",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            with (out_dir / "rox_outreach.csv").open("r", newline="", encoding="utf-8") as input_file:
+                rox_rows = list(csv.DictReader(input_file))
+            self.assertEqual(len(rox_rows), 2)
+            self.assertEqual(rox_rows[0]["campaign"], "primary-care")
+            self.assertIn("primary care practice", rox_rows[0]["call_opener_draft"])
+
+            payload = json.loads((out_dir / "publish_payload.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["campaign"], "primary-care")
+            self.assertEqual(payload["profiles"][0]["campaign"], "primary-care")
+
+            summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["campaign"], "primary-care")
+
+    def test_campaign_and_specialty_filters_are_combined(self) -> None:
+        module = load_portable_module()
+        campaign = module._campaign_for_name("dermatology")
+        filters = module._combined_specialty_filters(["pediatrics"], campaign)
+
+        self.assertIn("pediatrics", filters)
+        self.assertIn("dermatology", filters)
+
+    def test_practice_grouping_groups_same_office_doctors(self) -> None:
+        module = load_portable_module()
+
+        def record(npi: str, first_name: str, last_name: str, phone: str):
+            return module.DoctorRecord(
+                npi=npi,
+                first_name=first_name,
+                middle_name="",
+                last_name=last_name,
+                credential="MD",
+                display_name=f"{first_name} {last_name}, MD",
+                primary_taxonomy_code="207R00000X",
+                primary_specialty="Internal Medicine",
+                practice_address_1="100 Main St",
+                practice_address_2="Suite 200",
+                practice_city="Austin",
+                practice_state="TX",
+                practice_zip="78701",
+                practice_phone=phone,
+                source_fetched_at="2026-06-09T00:00:00+00:00",
+                matched_zips=["78701"],
+            )
+
+        records = [
+            record("1111111111", "Ada", "One", "(512) 555-0100"),
+            record("2222222222", "Ben", "Two", "5125550100"),
+            record("3333333333", "Cy", "Three", "5125559999"),
+        ]
+
+        groups = module._build_practice_groups(records)
+        rows = module._practice_group_rows(groups)
+
+        self.assertEqual(sorted(group.size for group in groups), [1, 2])
+        group_with_two = next(row for row in rows if row["practice_group_size"] == "2")
+        self.assertIn("Ada One, MD", group_with_two["doctors"])
+        self.assertIn("2222222222", group_with_two["npi_list"])
+
+    def test_rox_today_excludes_do_not_contact_and_low_priority(self) -> None:
+        module = load_portable_module()
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory) / "bundle"
+            ledger = Path(directory) / "activation_status.csv"
+            ledger.write_text(
+                "npi,activation_status,profile_url,display_name,specialty,practice_zip,last_seen_at\n"
+                "1234567890,do_not_contact,,,,,\n",
+                encoding="utf-8",
+            )
+
+            exit_code = module.main(
+                [
+                    "--zip",
+                    "78701",
+                    "--fixture",
+                    str(FIXTURE),
+                    "--out",
+                    str(out_dir),
+                    "--status-ledger",
+                    str(ledger),
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            with (out_dir / "rox_today.csv").open("r", newline="", encoding="utf-8") as input_file:
+                queue_rows = list(csv.DictReader(input_file))
+            self.assertEqual(queue_rows, [])
+
+            summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["status_counts"]["do_not_contact"], 1)
+            self.assertEqual(summary["priority_counts"]["low"], 2)
 
     def test_publish_to_certumalink_requires_env(self) -> None:
         module = load_portable_module()
@@ -134,6 +272,14 @@ class PortableV2Tests(unittest.TestCase):
                         "updated_count": 0,
                         "skipped_count": 0,
                         "error_count": 0,
+                        "results": [
+                            {
+                                "npi": "1234567890",
+                                "action": "created",
+                                "profile_id": "prof_123",
+                                "claim_url": "https://www.certumalink.com/claim/abc123",
+                            }
+                        ],
                     }
                 ).encode("utf-8")
 
@@ -178,9 +324,18 @@ class PortableV2Tests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(result["response"]["import_id"], "imp_123")
 
+            with (out_dir / "profile_drafts.csv").open("r", newline="", encoding="utf-8") as input_file:
+                profiles = list(csv.DictReader(input_file))
+            self.assertEqual(profiles[0]["claim_url"], "https://www.certumalink.com/claim/abc123")
+
+            with (out_dir / "rox_today.csv").open("r", newline="", encoding="utf-8") as input_file:
+                queue_rows = list(csv.DictReader(input_file))
+            self.assertEqual(queue_rows[0]["claim_url"], "https://www.certumalink.com/claim/abc123")
+
             summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["certumalink_publish"]["import_id"], "imp_123")
             self.assertEqual(summary["certumalink_publish"]["created"], 2)
+            self.assertEqual(summary["certumalink_publish"]["claim_links"], 1)
 
     def test_publish_to_certumalink_http_error_writes_result_and_fails(self) -> None:
         module = load_portable_module()
