@@ -27,8 +27,8 @@ For the hosted no-repo workflow, the command should be:
 certumalink_run --zip
 ```
 
-It prompts for the ZIP, writes a timestamped CSV, and prints the import report
-in the terminal.
+It prompts for the ZIP, writes a timestamped output folder, creates profile
+draft and Rox outreach exports, and prints the import report in the terminal.
 
 ## ZIP File Format
 

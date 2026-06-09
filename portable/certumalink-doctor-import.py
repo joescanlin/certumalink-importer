@@ -19,11 +19,20 @@ from urllib.request import Request, urlopen
 
 
 CMS_API_URL = "https://npiregistry.cms.hhs.gov/api/"
+CERTUMALINK_BASE_URL = "https://www.certumalink.com"
 SOURCE = "cms_nppes_registry_api"
 PHYSICIAN_TAXONOMY_PREFIXES = ("207", "208")
 ZIP_RE = re.compile(r"(\d{5})(?:-\d{4})?$")
 NPI_RE = re.compile(r"^\d{10}$")
 ZIP_HEADERS = {"zip", "zipcode", "zip_code", "postal_code", "postalcode"}
+DEFAULT_ACTIVATION_STATUS = "draft_profile_created"
+VALID_ACTIVATION_STATUSES = {
+    "draft_profile_created",
+    "rox_contacted",
+    "physician_activated",
+    "do_not_contact",
+    "needs_review",
+}
 EXPORT_FIELDS = [
     "npi",
     "first_name",
@@ -42,6 +51,44 @@ EXPORT_FIELDS = [
     "matched_zips",
     "source",
     "source_fetched_at",
+]
+PROFILE_DRAFT_FIELDS = [
+    "npi",
+    "profile_url",
+    "profile_slug",
+    "display_name",
+    "first_name",
+    "last_name",
+    "credential",
+    "specialty",
+    "taxonomy_code",
+    "city",
+    "state",
+    "practice_zip",
+    "practice_phone",
+    "source",
+    "source_fetched_at",
+    "activation_status",
+]
+ROX_OUTREACH_FIELDS = [
+    "npi",
+    "doctor_name",
+    "specialty",
+    "practice_phone",
+    "city",
+    "state",
+    "profile_url",
+    "activation_status",
+    "suggested_pitch",
+]
+ACTIVATION_STATUS_FIELDS = [
+    "npi",
+    "activation_status",
+    "profile_url",
+    "display_name",
+    "specialty",
+    "practice_zip",
+    "last_seen_at",
 ]
 PROMPT_FOR_ZIP = "__PROMPT_FOR_ZIP__"
 
@@ -101,8 +148,13 @@ class ImportStats:
     skipped_records: int = 0
     duplicate_npis: int = 0
     repeated_pages_stopped: int = 0
+    skip_reasons: dict[str, int] = field(default_factory=dict)
 
-    def to_log_payload(self) -> dict[str, int]:
+    def add_skip(self, reason: str, count: int = 1) -> None:
+        self.skipped_records += count
+        self.skip_reasons[reason] = self.skip_reasons.get(reason, 0) + count
+
+    def to_log_payload(self) -> dict[str, object]:
         return {
             "zip_count": self.zip_count,
             "response_pages": self.response_pages,
@@ -111,6 +163,7 @@ class ImportStats:
             "skipped_records": self.skipped_records,
             "duplicate_npis": self.duplicate_npis,
             "repeated_pages_stopped": self.repeated_pages_stopped,
+            "skip_reasons": self.skip_reasons,
         }
 
 
@@ -129,6 +182,18 @@ class ValidationReport:
             return f"Valid export: {self.total_rows} rows in {self.path}"
         details = "\n".join(f"- {error}" for error in self.errors)
         return f"Invalid export: {self.total_rows} rows in {self.path}\n{details}"
+
+
+@dataclass
+class OutputBundle:
+    bundle_mode: bool
+    output_dir: Path
+    doctors_path: Path
+    profile_drafts_path: Path | None = None
+    rox_outreach_path: Path | None = None
+    publish_payload_path: Path | None = None
+    activation_status_path: Path | None = None
+    summary_path: Path | None = None
 
 
 class NppesClient:
@@ -190,6 +255,7 @@ def import_zip_codes(
     client: NppesClient,
     fixture_path: Path | None = None,
     max_pages_per_zip: int | None = None,
+    specialty_filters: list[str] | None = None,
     stats: ImportStats,
     progress: Callable[[str], None] | None = None,
 ) -> list[DoctorRecord]:
@@ -212,6 +278,7 @@ def import_zip_codes(
             results = response.get("results", [])
             if not isinstance(results, list):
                 _progress(progress, f"[{zip_code}] Page {page_index}: skipped malformed response")
+                stats.add_skip("malformed_response")
                 continue
             page_signature = _page_signature(results)
             if page_signature and page_signature in seen_page_signatures:
@@ -232,11 +299,18 @@ def import_zip_codes(
             before_duplicates = stats.duplicate_npis
             for result in results:
                 if not isinstance(result, Mapping):
-                    stats.skipped_records += 1
+                    stats.add_skip("malformed_record")
                     continue
-                record = normalize_result(result, matched_zip=zip_code, fetched_at=fetched_at)
+                record, skip_reason = normalize_result_with_reason(
+                    result,
+                    matched_zip=zip_code,
+                    fetched_at=fetched_at,
+                )
                 if record is None:
-                    stats.skipped_records += 1
+                    stats.add_skip(skip_reason or "malformed_record")
+                    continue
+                if not _matches_specialty(record, specialty_filters):
+                    stats.add_skip("specialty_filter_mismatch")
                     continue
                 existing = records_by_npi.get(record.npi)
                 if existing is None:
@@ -245,6 +319,7 @@ def import_zip_codes(
                 else:
                     existing.add_matched_zip(zip_code)
                     stats.duplicate_npis += 1
+                    stats.add_skip("duplicate_npi")
             _progress(
                 progress,
                 (
@@ -268,25 +343,35 @@ def normalize_result(
     matched_zip: str,
     fetched_at: str,
 ) -> DoctorRecord | None:
+    record, _ = normalize_result_with_reason(result, matched_zip=matched_zip, fetched_at=fetched_at)
+    return record
+
+
+def normalize_result_with_reason(
+    result: Mapping[str, object],
+    *,
+    matched_zip: str,
+    fetched_at: str,
+) -> tuple[DoctorRecord | None, str | None]:
     if str(result.get("enumeration_type") or "").upper() not in ("", "NPI-1"):
-        return None
+        return None, "non_individual_provider"
 
     basic = _mapping(result.get("basic"))
     if not _is_active(basic):
-        return None
+        return None, "inactive_or_deactivated"
 
     taxonomy = _select_physician_taxonomy(result.get("taxonomies"))
     if taxonomy is None:
-        return None
+        return None, "non_physician_taxonomy"
 
     query_zip = normalize_zip_code(matched_zip)
     address = _select_practice_address(result.get("addresses"), matched_zip=query_zip)
     if address is None:
-        return None
+        return None, "practice_zip_mismatch"
 
     npi = _clean(result.get("number"))
     if not npi:
-        return None
+        return None, "malformed_record"
 
     first_name = _clean(basic.get("first_name"))
     middle_name = _clean(basic.get("middle_name"))
@@ -312,7 +397,7 @@ def normalize_result(
         source_fetched_at=fetched_at,
     )
     record.add_matched_zip(query_zip)
-    return record
+    return record, None
 
 
 def read_zip_file(path: Path) -> list[str]:
@@ -418,6 +503,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--format", choices=("csv", "json"), default=None)
     parser.add_argument("--max-pages", type=int, default=None, help="Maximum CMS pages per ZIP.")
+    parser.add_argument(
+        "--specialty",
+        action="append",
+        default=[],
+        help="Filter physicians by specialty text, e.g. dermatology. Can be repeated.",
+    )
+    parser.add_argument(
+        "--publish-dry-run",
+        action="store_true",
+        help="Generate future Certumalink publish payloads. Default output bundles already include this.",
+    )
+    parser.add_argument(
+        "--status-ledger",
+        default=None,
+        help="Optional persistent activation status CSV keyed by NPI.",
+    )
     parser.add_argument("--fixture", default=None, help="Read CMS-like JSON fixture instead of live API.")
     parser.add_argument("--validate-only", action="store_true", help="Only validate --out.")
     parser.add_argument(
@@ -458,40 +559,65 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("no valid ZIP codes found")
 
         max_pages = _max_pages(args.max_pages)
-        out_path = Path(args.out) if args.out else _default_out_path(zip_codes, args.format)
+        specialty_filters = _normalize_specialty_filters(args.specialty)
+        bundle = _resolve_output_bundle(
+            zip_codes,
+            out_value=args.out,
+            output_format=args.format,
+            force_bundle=args.publish_dry_run or bool(args.status_ledger),
+        )
         progress = None if args.quiet else _print_progress
         _progress(progress, "Preparing CMS NPPES physician import")
         _progress(progress, f"ZIPs queued: {len(zip_codes)}")
+        if specialty_filters:
+            _progress(progress, f"Specialty filter: {', '.join(specialty_filters)}")
         if max_pages is not None:
             _progress(progress, f"Page limit: {max_pages} page(s) per ZIP")
-        _progress(progress, f"Output will be written to: {out_path}")
+        _progress(progress, f"Output will be written to: {bundle.output_dir}")
         stats = ImportStats(zip_count=len(zip_codes))
         records = import_zip_codes(
             zip_codes,
             client=NppesClient(),
             fixture_path=Path(args.fixture) if args.fixture else None,
             max_pages_per_zip=max_pages,
+            specialty_filters=specialty_filters,
             stats=stats,
             progress=progress,
         )
-        _progress(progress, f"Writing {len(records)} physician records to {out_path}")
-        export_records(records, out_path, output_format=args.format)
+        _progress(progress, f"Writing {len(records)} physician records to {bundle.doctors_path}")
+        export_records(
+            records,
+            bundle.doctors_path,
+            output_format="csv" if bundle.bundle_mode else args.format,
+        )
+        bundle_outputs = _write_bundle_outputs(
+            bundle,
+            records,
+            stats=stats,
+            zip_codes=zip_codes,
+            specialty_filters=specialty_filters,
+            status_ledger_path=Path(args.status_ledger) if args.status_ledger else None,
+            publish_dry_run=args.publish_dry_run or bundle.bundle_mode,
+            progress=progress,
+        )
         _progress(progress, "Validating export file")
-        report = validate_export(out_path)
+        report = validate_export(bundle.doctors_path)
         _progress(progress, "Import complete")
 
         if args.json_log:
             payload = stats.to_log_payload()
             payload["event"] = "import_summary"
             payload["exported_records"] = len(records)
-            payload["out_path"] = str(out_path)
+            payload["out_path"] = str(bundle.output_dir)
             print(json.dumps(payload, sort_keys=True), file=sys.stderr)
         _print_report(
             stats=stats,
             exported_records=len(records),
-            out_path=out_path,
+            out_path=bundle.output_dir,
             zip_codes=zip_codes,
             report=report,
+            bundle_outputs=bundle_outputs,
+            specialty_filters=specialty_filters,
         )
         return 0 if report.is_valid else 1
     except Exception as exc:
@@ -501,6 +627,48 @@ def main(argv: list[str] | None = None) -> int:
 
 def infer_format(path: Path) -> str:
     return "json" if path.suffix.lower() == ".json" else "csv"
+
+
+def _resolve_output_bundle(
+    zip_codes: list[str],
+    *,
+    out_value: str | None,
+    output_format: str | None,
+    force_bundle: bool,
+) -> OutputBundle:
+    if out_value:
+        out_path = Path(out_value)
+        is_file_output = out_path.suffix.lower() in (".csv", ".json")
+        if is_file_output and not force_bundle:
+            return OutputBundle(
+                bundle_mode=False,
+                output_dir=out_path,
+                doctors_path=out_path,
+            )
+        output_dir = out_path if not is_file_output else out_path.with_suffix("")
+    else:
+        output_dir = _default_bundle_dir(zip_codes)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return OutputBundle(
+        bundle_mode=True,
+        output_dir=output_dir,
+        doctors_path=output_dir / "doctors.csv",
+        profile_drafts_path=output_dir / "profile_drafts.csv",
+        rox_outreach_path=output_dir / "rox_outreach.csv",
+        publish_payload_path=output_dir / "publish_payload.json",
+        activation_status_path=output_dir / "activation_status.csv",
+        summary_path=output_dir / "summary.json",
+    )
+
+
+def _default_bundle_dir(zip_codes: list[str]) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if len(zip_codes) == 1:
+        name = f"certumalink-import-{zip_codes[0]}-{stamp}"
+    else:
+        name = f"certumalink-import-{len(zip_codes)}-zips-{stamp}"
+    return Path.cwd() / name
 
 
 def _prompt_for_zip() -> str:
@@ -520,6 +688,252 @@ def _default_out_path(zip_codes: list[str], output_format: str | None) -> Path:
     return Path.cwd() / name
 
 
+def _normalize_specialty_filters(values: list[str]) -> list[str]:
+    filters: list[str] = []
+    for value in values:
+        for part in str(value).split(","):
+            cleaned = part.strip().lower()
+            if cleaned:
+                filters.append(cleaned)
+    return _dedupe(filters)
+
+
+def _matches_specialty(record: DoctorRecord, specialty_filters: list[str] | None) -> bool:
+    if not specialty_filters:
+        return True
+    specialty = record.primary_specialty.lower()
+    taxonomy = record.primary_taxonomy_code.lower()
+    return any(term in specialty or term == taxonomy for term in specialty_filters)
+
+
+def _write_bundle_outputs(
+    bundle: OutputBundle,
+    records: list[DoctorRecord],
+    *,
+    stats: ImportStats,
+    zip_codes: list[str],
+    specialty_filters: list[str],
+    status_ledger_path: Path | None,
+    publish_dry_run: bool,
+    progress: Callable[[str], None] | None,
+) -> dict[str, object]:
+    if not bundle.bundle_mode:
+        return {
+            "bundle_mode": False,
+            "doctors_path": str(bundle.doctors_path),
+            "profile_drafts": 0,
+            "rox_outreach": 0,
+            "publish_payloads": 0,
+            "status_counts": {},
+            "paths": {"doctors": str(bundle.doctors_path)},
+        }
+
+    existing_statuses = _read_status_ledger(status_ledger_path)
+    status_rows = _build_activation_status_rows(records, existing_statuses)
+    status_by_npi = {row["npi"]: row["activation_status"] for row in status_rows}
+    profile_rows = [_profile_draft_row(record, status_by_npi[record.npi]) for record in records]
+    rox_rows = [_rox_outreach_row(record, status_by_npi[record.npi]) for record in records]
+    publish_payload = _publish_payload(records, status_by_npi) if publish_dry_run else {
+        "dry_run": True,
+        "profiles": [],
+    }
+
+    _progress(progress, f"Writing profile drafts to {bundle.profile_drafts_path}")
+    _write_csv(profile_rows, PROFILE_DRAFT_FIELDS, bundle.profile_drafts_path)
+    _progress(progress, f"Writing Rox outreach CSV to {bundle.rox_outreach_path}")
+    _write_csv(rox_rows, ROX_OUTREACH_FIELDS, bundle.rox_outreach_path)
+    _progress(progress, f"Writing activation status ledger to {bundle.activation_status_path}")
+    _write_csv(status_rows, ACTIVATION_STATUS_FIELDS, bundle.activation_status_path)
+
+    if status_ledger_path is not None:
+        _progress(progress, f"Updating persistent status ledger at {status_ledger_path}")
+        _write_csv(_merge_status_rows(existing_statuses, status_rows), ACTIVATION_STATUS_FIELDS, status_ledger_path)
+
+    _progress(progress, f"Writing publish dry-run payload to {bundle.publish_payload_path}")
+    _write_json(publish_payload, bundle.publish_payload_path)
+
+    status_counts = _status_counts(status_rows)
+    summary = {
+        "bundle_mode": True,
+        "zip_codes": zip_codes,
+        "specialty_filters": specialty_filters,
+        "stats": stats.to_log_payload(),
+        "profile_drafts": len(profile_rows),
+        "rox_outreach": len(rox_rows),
+        "publish_payloads": len(publish_payload.get("profiles", [])),
+        "status_counts": status_counts,
+        "paths": {
+            "doctors": str(bundle.doctors_path),
+            "profile_drafts": str(bundle.profile_drafts_path),
+            "rox_outreach": str(bundle.rox_outreach_path),
+            "publish_payload": str(bundle.publish_payload_path),
+            "activation_status": str(bundle.activation_status_path),
+            "summary": str(bundle.summary_path),
+        },
+    }
+    _progress(progress, f"Writing summary JSON to {bundle.summary_path}")
+    _write_json(summary, bundle.summary_path)
+    return summary
+
+
+def _profile_draft_row(record: DoctorRecord, activation_status: str) -> dict[str, str]:
+    slug = _profile_slug(record)
+    return {
+        "npi": record.npi,
+        "profile_url": _profile_url(record),
+        "profile_slug": slug,
+        "display_name": record.display_name,
+        "first_name": record.first_name,
+        "last_name": record.last_name,
+        "credential": record.credential,
+        "specialty": record.primary_specialty,
+        "taxonomy_code": record.primary_taxonomy_code,
+        "city": record.practice_city,
+        "state": record.practice_state,
+        "practice_zip": record.practice_zip,
+        "practice_phone": record.practice_phone,
+        "source": record.source,
+        "source_fetched_at": record.source_fetched_at,
+        "activation_status": activation_status,
+    }
+
+
+def _rox_outreach_row(record: DoctorRecord, activation_status: str) -> dict[str, str]:
+    return {
+        "npi": record.npi,
+        "doctor_name": record.display_name,
+        "specialty": record.primary_specialty,
+        "practice_phone": record.practice_phone,
+        "city": record.practice_city,
+        "state": record.practice_state,
+        "profile_url": _profile_url(record),
+        "activation_status": activation_status,
+        "suggested_pitch": _suggested_pitch(record),
+    }
+
+
+def _publish_payload(records: list[DoctorRecord], status_by_npi: dict[str, str]) -> dict[str, object]:
+    return {
+        "dry_run": True,
+        "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "source": SOURCE,
+        "profiles": [_profile_draft_row(record, status_by_npi[record.npi]) for record in records],
+    }
+
+
+def _build_activation_status_rows(
+    records: list[DoctorRecord],
+    existing_statuses: dict[str, dict[str, str]],
+) -> list[dict[str, str]]:
+    seen_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    rows: list[dict[str, str]] = []
+    for record in records:
+        existing = existing_statuses.get(record.npi, {})
+        activation_status = existing.get("activation_status") or DEFAULT_ACTIVATION_STATUS
+        if activation_status not in VALID_ACTIVATION_STATUSES:
+            raise ValueError(f"invalid activation status for NPI {record.npi}: {activation_status}")
+        rows.append(
+            {
+                "npi": record.npi,
+                "activation_status": activation_status,
+                "profile_url": _profile_url(record),
+                "display_name": record.display_name,
+                "specialty": record.primary_specialty,
+                "practice_zip": record.practice_zip,
+                "last_seen_at": seen_at,
+            }
+        )
+    return rows
+
+
+def _merge_status_rows(
+    existing_statuses: dict[str, dict[str, str]],
+    current_rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    merged = dict(existing_statuses)
+    for row in current_rows:
+        merged[row["npi"]] = row
+    return [merged[npi] for npi in sorted(merged)]
+
+
+def _read_status_ledger(path: Path | None) -> dict[str, dict[str, str]]:
+    if path is None or not path.exists():
+        return {}
+    with path.open("r", newline="", encoding="utf-8") as input_file:
+        rows = list(csv.DictReader(input_file))
+    statuses: dict[str, dict[str, str]] = {}
+    for row in rows:
+        npi = str(row.get("npi", "")).strip()
+        status = str(row.get("activation_status", "")).strip()
+        if not npi:
+            continue
+        if status and status not in VALID_ACTIVATION_STATUSES:
+            raise ValueError(f"invalid activation status for NPI {npi}: {status}")
+        statuses[npi] = {
+            "npi": npi,
+            "activation_status": status or DEFAULT_ACTIVATION_STATUS,
+            "profile_url": str(row.get("profile_url", "")).strip(),
+            "display_name": str(row.get("display_name", "")).strip(),
+            "specialty": str(row.get("specialty", "")).strip(),
+            "practice_zip": str(row.get("practice_zip", "")).strip(),
+            "last_seen_at": str(row.get("last_seen_at", "")).strip(),
+        }
+    return statuses
+
+
+def _status_counts(rows: list[dict[str, str]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        status = row["activation_status"]
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _profile_url(record: DoctorRecord) -> str:
+    return f"{CERTUMALINK_BASE_URL}/doctors/{_profile_slug(record)}"
+
+
+def _profile_slug(record: DoctorRecord) -> str:
+    name = " ".join(part for part in (record.first_name, record.last_name) if part) or record.display_name
+    base = _slugify(name) or "doctor"
+    return f"{base}-{record.npi}"
+
+
+def _slugify(value: str) -> str:
+    lower = value.encode("ascii", "ignore").decode("ascii").lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", lower).strip("-")
+    return re.sub(r"-+", "-", slug)
+
+
+def _suggested_pitch(record: DoctorRecord) -> str:
+    last_name = record.last_name or record.display_name
+    specialty = record.primary_specialty or "medical"
+    city = record.practice_city or "your area"
+    return (
+        f"Dr. {last_name}, Certumalink has prepared a profile for your "
+        f"{specialty} practice in {city}. We can help you activate and review it."
+    )
+
+
+def _write_csv(rows: list[dict[str, str]], fieldnames: list[str], path: Path | None) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as output:
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_json(payload: object, path: Path | None) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as output:
+        json.dump(payload, output, indent=2, sort_keys=True)
+        output.write("\n")
+
+
 def _print_report(
     *,
     stats: ImportStats,
@@ -527,6 +941,8 @@ def _print_report(
     out_path: Path,
     zip_codes: list[str],
     report: ValidationReport,
+    bundle_outputs: dict[str, object],
+    specialty_filters: list[str],
 ) -> None:
     shown_zips = ", ".join(zip_codes[:8])
     if len(zip_codes) > 8:
@@ -536,14 +952,29 @@ def _print_report(
     print("Certumalink Doctor Import Report")
     print("--------------------------------")
     print(f"ZIPs: {shown_zips}")
+    if specialty_filters:
+        print(f"Specialty filter: {', '.join(specialty_filters)}")
     print(f"Output: {out_path}")
     print(f"CMS records scanned: {stats.source_records}")
     print(f"Physicians exported: {exported_records}")
     print(f"Skipped records: {stats.skipped_records}")
+    if stats.skip_reasons:
+        print("Skip reasons:")
+        for reason, count in sorted(stats.skip_reasons.items()):
+            print(f"  - {reason}: {count}")
     print(f"Duplicate NPIs merged: {stats.duplicate_npis}")
     print(f"CMS response pages: {stats.response_pages}")
     if stats.repeated_pages_stopped:
         print(f"Repeated CMS pages stopped: {stats.repeated_pages_stopped}")
+    if bundle_outputs.get("bundle_mode"):
+        print(f"Profile drafts created: {bundle_outputs.get('profile_drafts', 0)}")
+        print(f"Rox outreach rows created: {bundle_outputs.get('rox_outreach', 0)}")
+        print(f"Publish dry-run payloads: {bundle_outputs.get('publish_payloads', 0)}")
+        status_counts = bundle_outputs.get("status_counts") or {}
+        if isinstance(status_counts, Mapping) and status_counts:
+            print("Activation statuses:")
+            for status, count in sorted(status_counts.items()):
+                print(f"  - {status}: {count}")
     print(f"Validation: {'passed' if report.is_valid else 'failed'}")
     if not report.is_valid:
         print(report.summary())

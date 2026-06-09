@@ -50,8 +50,26 @@ Then they run:
 certumalink_run --zip
 ```
 
-It will ask for the ZIP code, create a timestamped CSV in the current folder,
-print progress as CMS pages are processed, and finish with a terminal report.
+It will ask for the ZIP code, create a timestamped output folder in the current
+directory, print progress as CMS pages are processed, and finish with a terminal
+report.
+
+The output folder includes:
+
+- `doctors.csv`
+- `profile_drafts.csv`
+- `rox_outreach.csv`
+- `publish_payload.json`
+- `activation_status.csv`
+- `summary.json`
+
+Useful options:
+
+```sh
+certumalink_run --zip 49506 --specialty dermatology
+certumalink_run --zip 49506 --status-ledger activation_status.csv
+certumalink_run --zip 49506 --quiet
+```
 
 ## Later Upgrade: GitHub Releases
 

@@ -34,7 +34,11 @@ python3 certumalink-doctor-import.py --zip
 ```
 
 5. When prompted, enter the user's ZIP code.
-6. Report the terminal import report, output path, row count, and first 5 rows.
+6. Report the terminal import report, output folder, profile draft count, Rox outreach count, and first 5 rows from `doctors.csv`.
+
+The default output folder contains `doctors.csv`, `profile_drafts.csv`,
+`rox_outreach.csv`, `publish_payload.json`, `activation_status.csv`, and
+`summary.json`.
 
 ## Rules
 

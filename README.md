@@ -19,8 +19,8 @@ certumalink_run --zip
 ```
 
 The command prompts for a ZIP code, imports live CMS NPPES physician records,
-creates a timestamped CSV in the current folder, validates the output, and
-prints a terminal report.
+creates a timestamped output folder in the current directory, validates the
+output, and prints a terminal report.
 
 During longer runs, it prints progress as each ZIP and CMS response page is
 processed, so users can tell the import is still working.
@@ -32,6 +32,12 @@ You can also pass the ZIP directly:
 
 ```sh
 certumalink_run --zip 78701
+```
+
+Filter to one specialty:
+
+```sh
+certumalink_run --zip 78701 --specialty dermatology
 ```
 
 For a ZIP list:
@@ -58,18 +64,55 @@ Suppress progress messages and only print the final report:
 certumalink_run --zip 78701 --quiet
 ```
 
+Reuse a persistent activation status ledger:
+
+```sh
+certumalink_run --zip 78701 --status-ledger activation_status.csv
+```
+
+## Output Folder
+
+The default output folder contains:
+
+- `doctors.csv` - normalized CMS physician export
+- `profile_drafts.csv` - Certumalink draft profile rows with deterministic profile URLs
+- `rox_outreach.csv` - Rox-ready activation outreach rows with suggested pitch text
+- `publish_payload.json` - dry-run profile payloads for future Certumalink API publishing
+- `activation_status.csv` - local NPI-keyed activation status ledger for this run
+- `summary.json` - machine-readable run summary, skip reasons, and output paths
+
+Profile URLs use this shape:
+
+```text
+https://www.certumalink.com/doctors/{first-last}-{npi}
+```
+
+Example:
+
+```text
+https://www.certumalink.com/doctors/joanne-adams-1255396008
+```
+
 Example report:
 
 ```text
 Certumalink Doctor Import Report
 --------------------------------
 ZIPs: 78701
-Output: certumalink-doctors-78701-20260608-162632.csv
+Output: certumalink-import-78701-20260609-143000
 CMS records scanned: 200
 Physicians exported: 32
 Skipped records: 168
+Skip reasons:
+  - non_physician_taxonomy: 102
+  - practice_zip_mismatch: 66
 Duplicate NPIs merged: 0
 CMS response pages: 1
+Profile drafts created: 32
+Rox outreach rows created: 32
+Publish dry-run payloads: 32
+Activation statuses:
+  - draft_profile_created: 32
 Validation: passed
 ```
 
