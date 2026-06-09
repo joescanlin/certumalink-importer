@@ -50,6 +50,12 @@ Then they run:
 certumalink_run --zip
 ```
 
+To update later:
+
+```sh
+certumalink_run --update
+```
+
 It will ask for the ZIP code, create a timestamped output folder in the current
 directory, print progress as CMS pages are processed, and finish with a terminal
 report.

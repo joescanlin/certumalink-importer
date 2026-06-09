@@ -18,6 +18,12 @@ Then run:
 certumalink_run --zip
 ```
 
+Update later with:
+
+```sh
+certumalink_run --update
+```
+
 The command prompts for a ZIP code, imports live CMS NPPES physician records,
 creates a timestamped output folder in the current directory, validates the
 output, and prints a terminal report.

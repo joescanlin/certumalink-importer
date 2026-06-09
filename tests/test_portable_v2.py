@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -227,6 +228,60 @@ class PortableV2Tests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["status"], 422)
             self.assertEqual(result["response"]["error_count"], 1)
+
+    def test_update_flag_does_not_require_zip(self) -> None:
+        module = load_portable_module()
+
+        with patch.object(module, "_update_self", return_value=0) as update_self:
+            exit_code = module.main(["--update"])
+
+        self.assertEqual(exit_code, 0)
+        update_self.assert_called_once_with()
+
+    def test_update_self_replaces_target_script(self) -> None:
+        module = load_portable_module()
+        requests = []
+        updated_source = "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                'CMS_API_URL = "https://npiregistry.cms.hhs.gov/api/"',
+                "",
+                "def main():",
+                "    return 0",
+                "",
+            ]
+        )
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return updated_source.encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            requests.append(request)
+            return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "certumalink-doctor-import.py"
+            target.write_text("old source", encoding="utf-8")
+            os.chmod(target, 0o600)
+
+            with patch.dict(
+                module.os.environ,
+                {"CERTUMALINK_IMPORTER_URL": "https://example.test/certumalink.py"},
+                clear=True,
+            ), patch.object(module, "urlopen", fake_urlopen):
+                exit_code = module._update_self(target)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(target.read_text(encoding="utf-8"), updated_source)
+            self.assertTrue(target.stat().st_mode & 0o100)
+            self.assertEqual(requests[0].full_url, "https://example.test/certumalink.py")
 
 
 if __name__ == "__main__":

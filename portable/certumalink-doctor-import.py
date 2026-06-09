@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 
 CMS_API_URL = "https://npiregistry.cms.hhs.gov/api/"
+SCRIPT_DOWNLOAD_URL = "https://raw.githubusercontent.com/joescanlin/certumalink-importer/main/portable/certumalink-doctor-import.py"
 CERTUMALINK_BASE_URL = "https://www.certumalink.com"
 SOURCE = "cms_nppes_registry_api"
 PHYSICIAN_TAXONOMY_PREFIXES = ("207", "208")
@@ -538,6 +539,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress progress messages. The final report still prints.",
     )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Download and install the latest hosted version of certumalink_run.",
+    )
     return parser
 
 
@@ -546,6 +552,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        if args.update:
+            return _update_self()
+
         if args.validate_only:
             if not args.out:
                 parser.error("--out is required with --validate-only")
@@ -684,6 +693,44 @@ def _default_bundle_dir(zip_codes: list[str]) -> Path:
     else:
         name = f"certumalink-import-{len(zip_codes)}-zips-{stamp}"
     return Path.cwd() / name
+
+
+def _update_self(target_path: Path | None = None) -> int:
+    source_url = os.environ.get("CERTUMALINK_IMPORTER_URL", SCRIPT_DOWNLOAD_URL).strip()
+    if not source_url:
+        raise ValueError("CERTUMALINK_IMPORTER_URL cannot be empty")
+
+    target = (target_path or Path(__file__)).resolve()
+    temp_path = target.with_name(f".{target.name}.tmp")
+    print("Updating certumalink_run from hosted source...")
+    request = Request(
+        source_url,
+        headers={"User-Agent": "certumalink-doctor-import/0.1"},
+    )
+    with urlopen(request, timeout=30) as response:
+        source = response.read().decode("utf-8")
+
+    _validate_update_source(source)
+    try:
+        temp_path.write_text(source, encoding="utf-8")
+        current_mode = target.stat().st_mode if target.exists() else 0o755
+        os.chmod(temp_path, current_mode | 0o111)
+        os.replace(temp_path, target)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    print("Updated certumalink_run to the latest hosted version.")
+    print(f"Installed script: {target}")
+    print("Try:")
+    print("  certumalink_run --zip 49506")
+    return 0
+
+
+def _validate_update_source(source: str) -> None:
+    if "CMS_API_URL" not in source or "def main(" not in source:
+        raise ValueError("downloaded update does not look like the Certumalink importer")
+    compile(source, SCRIPT_DOWNLOAD_URL, "exec")
 
 
 def _prompt_for_zip() -> str:
