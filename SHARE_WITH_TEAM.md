@@ -71,6 +71,16 @@ certumalink_run --zip 49506 --status-ledger activation_status.csv
 certumalink_run --zip 49506 --quiet
 ```
 
+When the platform API is ready, admins can publish private draft profiles:
+
+```sh
+export CERTUMALINK_API_URL="https://www.certumalink.com"
+export CERTUMALINK_API_TOKEN="..."
+certumalink_run --zip 49506 --publish-to-certumalink
+```
+
+The endpoint contract for that API is in `docs/profile-seeding-api.md`.
+
 ## Later Upgrade: GitHub Releases
 
 Create a small public GitHub repo, for example:

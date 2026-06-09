@@ -70,6 +70,16 @@ Reuse a persistent activation status ledger:
 certumalink_run --zip 78701 --status-ledger activation_status.csv
 ```
 
+Publish draft profiles to Certumalink once the platform endpoint exists:
+
+```sh
+export CERTUMALINK_API_URL="https://www.certumalink.com"
+export CERTUMALINK_API_TOKEN="..."
+certumalink_run --zip 78701 --publish-to-certumalink
+```
+
+The expected backend endpoint contract is documented in `docs/profile-seeding-api.md`.
+
 ## Output Folder
 
 The default output folder contains:
@@ -78,6 +88,7 @@ The default output folder contains:
 - `profile_drafts.csv` - Certumalink draft profile rows with deterministic profile URLs
 - `rox_outreach.csv` - Rox-ready activation outreach rows with suggested pitch text
 - `publish_payload.json` - dry-run profile payloads for future Certumalink API publishing
+- `publish_result.json` - present only when `--publish-to-certumalink` is used
 - `activation_status.csv` - local NPI-keyed activation status ledger for this run
 - `summary.json` - machine-readable run summary, skip reasons, and output paths
 

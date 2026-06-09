@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 import time
@@ -192,6 +193,7 @@ class OutputBundle:
     profile_drafts_path: Path | None = None
     rox_outreach_path: Path | None = None
     publish_payload_path: Path | None = None
+    publish_result_path: Path | None = None
     activation_status_path: Path | None = None
     summary_path: Path | None = None
 
@@ -515,6 +517,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate future Certumalink publish payloads. Default output bundles already include this.",
     )
     parser.add_argument(
+        "--publish-to-certumalink",
+        action="store_true",
+        help="POST draft profiles to Certumalink using CERTUMALINK_API_URL and CERTUMALINK_API_TOKEN.",
+    )
+    parser.add_argument(
         "--status-ledger",
         default=None,
         help="Optional persistent activation status CSV keyed by NPI.",
@@ -564,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
             zip_codes,
             out_value=args.out,
             output_format=args.format,
-            force_bundle=args.publish_dry_run or bool(args.status_ledger),
+            force_bundle=args.publish_dry_run or args.publish_to_certumalink or bool(args.status_ledger),
         )
         progress = None if args.quiet else _print_progress
         _progress(progress, "Preparing CMS NPPES physician import")
@@ -598,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
             specialty_filters=specialty_filters,
             status_ledger_path=Path(args.status_ledger) if args.status_ledger else None,
             publish_dry_run=args.publish_dry_run or bundle.bundle_mode,
+            publish_to_certumalink=args.publish_to_certumalink,
             progress=progress,
         )
         _progress(progress, "Validating export file")
@@ -619,7 +627,13 @@ def main(argv: list[str] | None = None) -> int:
             bundle_outputs=bundle_outputs,
             specialty_filters=specialty_filters,
         )
-        return 0 if report.is_valid else 1
+        publish_summary = bundle_outputs.get("certumalink_publish")
+        publish_failed = (
+            isinstance(publish_summary, Mapping)
+            and bool(publish_summary.get("attempted"))
+            and not bool(publish_summary.get("ok"))
+        )
+        return 0 if report.is_valid and not publish_failed else 1
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -657,6 +671,7 @@ def _resolve_output_bundle(
         profile_drafts_path=output_dir / "profile_drafts.csv",
         rox_outreach_path=output_dir / "rox_outreach.csv",
         publish_payload_path=output_dir / "publish_payload.json",
+        publish_result_path=output_dir / "publish_result.json",
         activation_status_path=output_dir / "activation_status.csv",
         summary_path=output_dir / "summary.json",
     )
@@ -715,6 +730,7 @@ def _write_bundle_outputs(
     specialty_filters: list[str],
     status_ledger_path: Path | None,
     publish_dry_run: bool,
+    publish_to_certumalink: bool,
     progress: Callable[[str], None] | None,
 ) -> dict[str, object]:
     if not bundle.bundle_mode:
@@ -752,6 +768,13 @@ def _write_bundle_outputs(
     _progress(progress, f"Writing publish dry-run payload to {bundle.publish_payload_path}")
     _write_json(publish_payload, bundle.publish_payload_path)
 
+    publish_result: dict[str, object] | None = None
+    if publish_to_certumalink:
+        _progress(progress, "Publishing draft profiles to Certumalink")
+        publish_result = _publish_to_certumalink(_publish_payload(records, status_by_npi, dry_run=False))
+        _progress(progress, f"Writing Certumalink publish result to {bundle.publish_result_path}")
+        _write_json(publish_result, bundle.publish_result_path)
+
     status_counts = _status_counts(status_rows)
     summary = {
         "bundle_mode": True,
@@ -761,12 +784,14 @@ def _write_bundle_outputs(
         "profile_drafts": len(profile_rows),
         "rox_outreach": len(rox_rows),
         "publish_payloads": len(publish_payload.get("profiles", [])),
+        "certumalink_publish": _publish_summary(publish_result),
         "status_counts": status_counts,
         "paths": {
             "doctors": str(bundle.doctors_path),
             "profile_drafts": str(bundle.profile_drafts_path),
             "rox_outreach": str(bundle.rox_outreach_path),
             "publish_payload": str(bundle.publish_payload_path),
+            "publish_result": str(bundle.publish_result_path) if publish_result is not None else "",
             "activation_status": str(bundle.activation_status_path),
             "summary": str(bundle.summary_path),
         },
@@ -812,12 +837,83 @@ def _rox_outreach_row(record: DoctorRecord, activation_status: str) -> dict[str,
     }
 
 
-def _publish_payload(records: list[DoctorRecord], status_by_npi: dict[str, str]) -> dict[str, object]:
+def _publish_payload(
+    records: list[DoctorRecord],
+    status_by_npi: dict[str, str],
+    *,
+    dry_run: bool = True,
+) -> dict[str, object]:
     return {
-        "dry_run": True,
+        "dry_run": dry_run,
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "source": SOURCE,
         "profiles": [_profile_draft_row(record, status_by_npi[record.npi]) for record in records],
+    }
+
+
+def _publish_to_certumalink(payload: dict[str, object]) -> dict[str, object]:
+    api_url = os.environ.get("CERTUMALINK_API_URL", "").strip().rstrip("/")
+    api_token = os.environ.get("CERTUMALINK_API_TOKEN", "").strip()
+    if not api_url:
+        raise ValueError("CERTUMALINK_API_URL is required for --publish-to-certumalink")
+    if not api_token:
+        raise ValueError("CERTUMALINK_API_TOKEN is required for --publish-to-certumalink")
+
+    endpoint = f"{api_url}/api/admin/imports/physician-profiles"
+    body = json.dumps(payload).encode("utf-8")
+    request = Request(
+        endpoint,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "certumalink-doctor-import/0.1",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            response_body = response.read().decode("utf-8")
+            parsed = json.loads(response_body) if response_body else {}
+            if not isinstance(parsed, Mapping):
+                parsed = {"response": parsed}
+            return {
+                "ok": 200 <= int(response.status) < 300,
+                "status": int(response.status),
+                "endpoint": endpoint,
+                "response": dict(parsed),
+            }
+    except HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed_error = json.loads(response_body) if response_body else {}
+        except json.JSONDecodeError:
+            parsed_error = {"message": response_body}
+        return {
+            "ok": False,
+            "status": int(exc.code),
+            "endpoint": endpoint,
+            "response": parsed_error,
+        }
+    except (URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Certumalink publish request failed: {exc}") from exc
+
+
+def _publish_summary(publish_result: dict[str, object] | None) -> dict[str, object]:
+    if publish_result is None:
+        return {"attempted": False}
+    response = publish_result.get("response")
+    response_map = response if isinstance(response, Mapping) else {}
+    return {
+        "attempted": True,
+        "ok": bool(publish_result.get("ok")),
+        "status": publish_result.get("status"),
+        "import_id": response_map.get("import_id") or response_map.get("id") or "",
+        "created": response_map.get("created_count", 0),
+        "updated": response_map.get("updated_count", 0),
+        "skipped": response_map.get("skipped_count", 0),
+        "errors": response_map.get("error_count", 0),
     }
 
 
@@ -970,6 +1066,22 @@ def _print_report(
         print(f"Profile drafts created: {bundle_outputs.get('profile_drafts', 0)}")
         print(f"Rox outreach rows created: {bundle_outputs.get('rox_outreach', 0)}")
         print(f"Publish dry-run payloads: {bundle_outputs.get('publish_payloads', 0)}")
+        publish_summary = bundle_outputs.get("certumalink_publish")
+        if isinstance(publish_summary, Mapping) and publish_summary.get("attempted"):
+            print(
+                "Certumalink publish: "
+                f"{'passed' if publish_summary.get('ok') else 'failed'} "
+                f"(status {publish_summary.get('status')})"
+            )
+            if publish_summary.get("import_id"):
+                print(f"Certumalink import ID: {publish_summary.get('import_id')}")
+            print(
+                "Certumalink results: "
+                f"created {publish_summary.get('created', 0)}, "
+                f"updated {publish_summary.get('updated', 0)}, "
+                f"skipped {publish_summary.get('skipped', 0)}, "
+                f"errors {publish_summary.get('errors', 0)}"
+            )
         status_counts = bundle_outputs.get("status_counts") or {}
         if isinstance(status_counts, Mapping) and status_counts:
             print("Activation statuses:")
