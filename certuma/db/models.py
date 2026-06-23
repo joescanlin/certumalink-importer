@@ -119,6 +119,8 @@ class Contact(Base):
     email_status = Column(Text, nullable=False, default="unknown")
     verifier = Column(Text)
     verified_at = Column(_TS)
+    is_role_address = Column(Boolean, nullable=False, default=False)  # info@/office@ -> demoted
+    discovery_source = Column(Text)
     created_at = Column(_TS, server_default=func.now())
 
 
@@ -162,6 +164,7 @@ class Lead(Base):
     claim_url = Column(Text)
     last_polled_at = Column(_TS)
     activation_detected_at = Column(_TS)
+    needs_reenrich = Column(Boolean, nullable=False, default=False)  # set on hard bounce
     version = Column(Integer, nullable=False, default=0)
     last_seen_at = Column(_TS)
     created_at = Column(_TS, server_default=func.now())
@@ -183,6 +186,7 @@ class Message(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     lead_id = Column(BigInteger, ForeignKey("lead.id"), nullable=False)
     thread_id = Column(BigInteger, ForeignKey("thread.id"))
+    mailbox_id = Column(BigInteger, ForeignKey("mailbox.id"))  # which mailbox sent it (nullable)
     npi = Column(String(10), nullable=False)
     campaign = Column(Text, ForeignKey("campaign.name"), nullable=False)
     cadence_step = Column(Integer, nullable=False)
@@ -246,6 +250,8 @@ class Template(Base):
     merge_tokens = Column(ARRAY(Text), nullable=False, default=list)
     is_approved = Column(Boolean, nullable=False, default=False)
     approved_by = Column(Text)
+    created_by = Column(Text)
+    variant_label = Column(Text, nullable=False, default="")
     created_at = Column(_TS, server_default=func.now())
 
 
@@ -294,8 +300,38 @@ class KillSwitch(Base):
     set_at = Column(_TS)
 
 
+class Mailbox(Base):
+    """A cold-domain sending account (Phase 1). Ships empty; one dev mailbox for Mailpit."""
+    __tablename__ = "mailbox"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    address = Column(CITEXT, unique=True, nullable=False)
+    display_name = Column(Text, nullable=False, default="")
+    title = Column(Text, nullable=False, default="")
+    domain = Column(Text, nullable=False, default="")
+    daily_cap = Column(Integer, nullable=False, default=50)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(_TS, server_default=func.now())
+
+
+class CircuitBreakerState(Base):
+    """Persisted complaint/bounce breaker state. The Gate READS it; the ingest side trips it."""
+    __tablename__ = "circuit_breaker_state"
+    __table_args__ = (
+        CheckConstraint("breaker IN ('complaint','bounce')", name="breaker_valid"),
+        UniqueConstraint("scope", "breaker", name="scope_breaker"),
+    )
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    scope = Column(Text, nullable=False)            # 'global' | 'campaign:<name>'
+    breaker = Column(Text, nullable=False)
+    is_tripped = Column(Boolean, nullable=False, default=False)
+    rate = Column(Numeric(6, 4), nullable=False, default=0)
+    sample_count = Column(Integer, nullable=False, default=0)
+    tripped_at = Column(_TS)
+    updated_at = Column(_TS, server_default=func.now())
+
+
 ALL_TABLES = [
     "practice_group", "app_user", "campaign", "prospect", "contact", "workflow_score",
     "lead", "thread", "message", "event", "suppression", "template", "approval",
-    "audit_log", "kill_switch",
+    "audit_log", "kill_switch", "mailbox", "circuit_breaker_state",
 ]

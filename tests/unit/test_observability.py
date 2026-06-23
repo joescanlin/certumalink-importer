@@ -71,6 +71,26 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(s.database_url, Settings().database_url)
         self.assertEqual(s.publish_token, "")
         self.assertEqual(s.esp_api_key, "")  # cold-ESP secret kept separate, empty by default
+        self.assertEqual(s.email_provider, "mailpit")     # dev default
+        self.assertEqual((s.smtp_host, s.smtp_port), ("127.0.0.1", 11025))  # Mailpit default
+
+    def test_phase1_sending_config(self):
+        s = Settings.from_env({
+            "CERTUMA_EMAIL_PROVIDER": "esp",
+            "CERTUMA_SMTP_PORT": "2525",
+            "CERTUMA_COLD_DOMAIN": "getcertuma.com",
+            "CERTUMA_SENDER_FROM_NAME": "Jordan Avery",
+            "CERTUMA_POSTAL_ADDRESS": "1 Main St, Austin TX",
+        })
+        self.assertEqual(s.email_provider, "esp")
+        self.assertEqual(s.smtp_port, 2525)
+        self.assertEqual(s.cold_domain, "getcertuma.com")
+        self.assertEqual(s.reply_to_domain, "getcertuma.com")  # defaults to cold_domain
+        self.assertEqual(s.sender_from_name, "Jordan Avery")
+        self.assertEqual(s.postal_address, "1 Main St, Austin TX")
+
+    def test_bad_smtp_port_falls_back(self):
+        self.assertEqual(Settings.from_env({"CERTUMA_SMTP_PORT": "nope"}).smtp_port, 11025)
 
 
 if __name__ == "__main__":

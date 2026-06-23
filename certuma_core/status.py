@@ -65,11 +65,15 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "queued_today": frozenset({"enriching", "sendable", "do_not_contact", "needs_review"}),
     "enriching": frozenset({"sendable", "needs_review", "do_not_contact", "exhausted"}),
     "sendable": frozenset({"email_sent", "enriching", "needs_review", "do_not_contact"}),
+    # email_sent / awaiting_reply -> interested are the claim-click activation edges (Phase 1):
+    # a claim_url click is an activation signal independent of any reply, so the poller must be
+    # able to reach `interested` (the only state from which `physician_activated` is legal) from a
+    # real send without waiting on the Phase 2 reply classifier. Both are driven by actor='poller'.
     "email_sent": frozenset(
-        {"awaiting_reply", "replied", "enriching", "exhausted", "do_not_contact", "needs_review"}
+        {"awaiting_reply", "replied", "interested", "enriching", "exhausted", "do_not_contact", "needs_review"}
     ),
     "awaiting_reply": frozenset(
-        {"replied", "email_sent", "enriching", "exhausted", "needs_review", "do_not_contact"}
+        {"replied", "interested", "email_sent", "enriching", "exhausted", "needs_review", "do_not_contact"}
     ),
     "replied": frozenset({"interested", "needs_review", "do_not_contact", "awaiting_reply", "exhausted"}),
     "interested": frozenset(
