@@ -38,8 +38,9 @@ downgrade:           ## roll all migrations back to base
 db-shell:            ## psql into the running container
 	docker compose exec db psql -U certuma -d certuma
 
-test-core:           ## pure-library + golden parity tests (no DB needed)
+test-core:           ## pure-library tests (golden parity + unit; no DB needed)
 	PYTHONPATH=.:src python3 -m unittest discover -s tests/golden -p "test_*.py"
+	PYTHONPATH=.:src python3 -m unittest discover -s tests/unit -p "test_*.py"
 
 test:                ## existing + golden suites (no DB needed)
 	PYTHONPATH=.:src python3 -m unittest discover -s tests -p "test_*.py"
