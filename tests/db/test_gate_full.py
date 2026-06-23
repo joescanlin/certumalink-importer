@@ -31,7 +31,11 @@ if HAVE_SA:
 DB_URL = os.environ.get("CERTUMA_DATABASE_URL") or (Settings().database_url if HAVE_SA else "")
 BUSINESS = datetime(2026, 6, 23, 14, tzinfo=timezone.utc)  # Tue 09:00 CDT
 QUIET = datetime(2026, 6, 23, 2, tzinfo=timezone.utc)       # Mon 21:00 CDT
-FULL_SETTINGS = Settings(postal_address="Certuma, 1 Main St, Austin TX", sender_from_email="jordan@getcertuma.com")
+# guarded so the module imports under system python (no SQLAlchemy); the class is skipped there
+FULL_SETTINGS = (
+    Settings(postal_address="Certuma, 1 Main St, Austin TX", sender_from_email="jordan@getcertuma.com")
+    if HAVE_SA else None
+)
 
 
 @unittest.skipUnless(HAVE_SA, "SQLAlchemy not installed")
