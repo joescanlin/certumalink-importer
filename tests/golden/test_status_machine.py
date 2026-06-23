@@ -64,6 +64,13 @@ class StatusGraphTests(unittest.TestCase):
         for src in ("email_sent", "awaiting_reply", "sendable"):
             status.assert_transition(src, "enriching")
 
+    def test_phase1_activation_edges_reachable(self):
+        # a claim_url click activates independent of any reply, so the poller must reach
+        # `interested` (and thus physician_activated) from a real send. (Phase 1, additive.)
+        status.assert_transition("email_sent", "interested")
+        status.assert_transition("awaiting_reply", "interested")
+        status.assert_transition("interested", "physician_activated")
+
     def test_queue_excluded_states(self):
         self.assertEqual(
             status.QUEUE_EXCLUDED_STATES,
