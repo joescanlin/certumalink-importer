@@ -20,8 +20,11 @@ from sqlalchemy.orm import Session
 
 from certuma_core.status import ACTIVATION_ONLY_ACTORS, IllegalTransition, assert_transition
 from certuma.db.models import AuditLog, Lead, Message
+from certuma.observability import METRICS, emit, get_logger
 
 __all__ = ["ConcurrencyConflict", "IllegalActor", "IllegalTransition", "transition"]
+
+_LOG = get_logger("certuma.ledger")
 
 
 class ConcurrencyConflict(Exception):
@@ -58,13 +61,19 @@ def transition(
 
     # 2. optimistic concurrency
     if lead.version != expected_version:
+        METRICS.incr("ledger_rejected", reason="concurrency")
         raise ConcurrencyConflict(lead_id, expected_version, lead.version)
 
     # 3. legality (raises IllegalTransition; terminal-safe)
-    assert_transition(lead.activation_status, new_status)
+    try:
+        assert_transition(lead.activation_status, new_status)
+    except IllegalTransition:
+        METRICS.incr("ledger_rejected", reason="illegal_transition")
+        raise
 
     # 3b. sole-success-metric guard: only the poller/webhook may activate
     if new_status == "physician_activated" and actor not in ACTIVATION_ONLY_ACTORS:
+        METRICS.incr("ledger_rejected", reason="illegal_actor")
         raise IllegalActor(f"actor {actor!r} may not set physician_activated")
 
     # 4. idempotency: insert the outbound message key BEFORE the ESP call upstream.
@@ -91,4 +100,7 @@ def transition(
         )
     )
     session.flush()
+    METRICS.incr("ledger_transition", new=new_status)
+    emit(_LOG, "lead_transition", lead_id=lead.id, npi=lead.npi,
+         old=old_status, new=new_status, actor=actor, reason_code=reason_code)
     return lead

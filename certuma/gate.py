@@ -11,6 +11,7 @@ floor and takes precedence over the switches.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
@@ -18,12 +19,22 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from certuma.db.models import Campaign, KillSwitch, Suppression
+from certuma.observability import METRICS, emit, get_logger
 
 __all__ = ["ALLOW", "HOLD", "BLOCK", "GateDecision", "evaluate"]
 
 ALLOW = "ALLOW"
 HOLD = "HOLD"
 BLOCK = "BLOCK"
+
+_LOG = get_logger("certuma.gate")
+
+
+def _decided(decision: "GateDecision") -> "GateDecision":
+    METRICS.incr("gate_decision", decision=decision.decision, reason=decision.reason_code or "")
+    emit(_LOG, "gate_decision", level=logging.DEBUG,
+         decision=decision.decision, reason_code=decision.reason_code)
+    return decision
 
 
 @dataclass(frozen=True)
@@ -58,11 +69,11 @@ def evaluate(
     """Decide whether an outbound action may proceed. Read-only; performs no transition."""
     # 1. suppression is the permanent BLOCK floor (checked first, by npi AND email)
     if _is_suppressed(session, npi, email):
-        return GateDecision(BLOCK, "suppression")
+        return _decided(GateDecision(BLOCK, "suppression"))
 
     # 2. global kill switch -> HOLD
     if session.execute(select(KillSwitch.is_active).where(KillSwitch.id == 1)).scalar():
-        return GateDecision(HOLD, "kill_switch")
+        return _decided(GateDecision(HOLD, "kill_switch"))
 
     # 3. per-campaign pause -> HOLD
     if campaign is not None:
@@ -70,6 +81,6 @@ def evaluate(
             select(Campaign.is_paused).where(Campaign.name == campaign)
         ).scalar()
         if paused:
-            return GateDecision(HOLD, "campaign_paused")
+            return _decided(GateDecision(HOLD, "campaign_paused"))
 
-    return GateDecision(ALLOW, None)
+    return _decided(GateDecision(ALLOW, None))

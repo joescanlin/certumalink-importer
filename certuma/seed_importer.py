@@ -29,8 +29,11 @@ from sqlalchemy.orm import Session
 
 from certuma_core.status import STATES, normalize_status
 from certuma.db.models import Lead, Prospect
+from certuma.observability import METRICS, emit, get_logger
 
 __all__ = ["LEGACY_CAMPAIGN", "LEAD_STATE_COLUMNS", "Reconciliation", "read_ledger", "prepare", "seed"]
+
+_LOG = get_logger("certuma.seed")
 
 LEGACY_CAMPAIGN = "legacy"
 REQUIRED_COLUMNS = {"npi", "activation_status"}
@@ -180,6 +183,8 @@ def seed(session: Session, path: Path | str, *, dry_run: bool = True) -> Reconci
     recon.dry_run = dry_run
 
     if recon.unknown_statuses:
+        METRICS.incr("seed_abort", reason="unknown_status")
+        emit(_LOG, "seed_aborted", reason="unknown_status", statuses=sorted(recon.unknown_statuses))
         raise ValueError(f"unknown activation statuses, aborting migration: {sorted(recon.unknown_statuses)}")
 
     npis = [r["npi"] for r in rows]
@@ -198,4 +203,9 @@ def seed(session: Session, path: Path | str, *, dry_run: bool = True) -> Reconci
         _upsert_lead_seed(session, rows)
         session.flush()
 
+    METRICS.incr("seed_run", dry_run=str(dry_run))
+    emit(_LOG, "seed_reconciliation", dry_run=dry_run, csv_rows=recon.csv_row_count,
+         unique=recon.npi_unique_count, inserts=recon.leads_to_insert,
+         updates=recon.leads_to_update, legacy_rewrites=recon.legacy_rewrites,
+         skipped_empty_npi=recon.empty_npi_skipped)
     return recon
