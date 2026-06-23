@@ -24,7 +24,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, CITEXT, JSONB
 
 from .base import Base
 
@@ -56,7 +56,7 @@ class AppUser(Base):
     __table_args__ = (CheckConstraint("role IN ('owner','backup','system')", name="role_valid"),)
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     name = Column(Text, nullable=False)
-    email = Column(Text, unique=True)
+    email = Column(CITEXT, unique=True)  # citext in DB: case-insensitive comparisons
     role = Column(Text, nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(_TS, server_default=func.now())
@@ -115,7 +115,7 @@ class Contact(Base):
     )
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     npi = Column(String(10), ForeignKey("prospect.npi"), nullable=False)
-    email = Column(Text)
+    email = Column(CITEXT)  # citext in DB
     email_status = Column(Text, nullable=False, default="unknown")
     verifier = Column(Text)
     verified_at = Column(_TS)
@@ -229,7 +229,7 @@ class Suppression(Base):
     )
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     npi = Column(String(10))
-    email = Column(Text)
+    email = Column(CITEXT)  # citext in DB: opt-out matching is case-insensitive
     reason = Column(Text, nullable=False)
     source = Column(Text, nullable=False, default="system")
     created_at = Column(_TS, server_default=func.now())
