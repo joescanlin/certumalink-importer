@@ -16,8 +16,9 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from certuma import gate
-from certuma.db.models import Approval, Campaign, KillSwitch, Lead, Prospect, Suppression
+from certuma.db.models import Approval, Campaign, KillSwitch, Lead, Prospect, Suppression, Template
 from certuma.db.session import make_session_factory
+from certuma.templates import TemplateNotFound, approve_template, lint_template
 
 _SessionFactory = None
 
@@ -50,6 +51,10 @@ class PauseBody(BaseModel):
 class DecisionBody(BaseModel):
     decision: str  # approved | rejected | edited
     decided_by: Optional[int] = None
+
+
+class ApproveTemplateBody(BaseModel):
+    approved_by: str
 
 
 def create_app() -> FastAPI:
@@ -137,6 +142,34 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="campaign not found")
         db.commit()
         return {"campaign": name, "is_paused": body.paused}
+
+    @app.get("/templates")
+    def list_templates(db: Session = Depends(get_db)):
+        rows = db.execute(select(Template).order_by(Template.id)).scalars().all()
+        return [
+            {"id": t.id, "campaign": t.campaign, "version": t.version, "subject": t.subject,
+             "is_approved": t.is_approved, "approved_by": t.approved_by, "variant_label": t.variant_label}
+            for t in rows
+        ]
+
+    @app.get("/templates/{template_id}/lint")
+    def lint_template_endpoint(template_id: int, db: Session = Depends(get_db)):
+        tpl = db.get(Template, template_id)
+        if tpl is None:
+            raise HTTPException(status_code=404, detail="template not found")
+        problems = lint_template(tpl)
+        return {"id": template_id, "ok": not problems, "problems": problems}
+
+    @app.post("/templates/{template_id}/approve")
+    def approve_template_endpoint(template_id: int, body: ApproveTemplateBody, db: Session = Depends(get_db)):
+        try:
+            tpl = approve_template(db, template_id, body.approved_by)
+        except TemplateNotFound:
+            raise HTTPException(status_code=404, detail="template not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        db.commit()
+        return {"id": tpl.id, "is_approved": tpl.is_approved, "approved_by": tpl.approved_by}
 
     @app.get("/gate/preview")
     def gate_preview(
