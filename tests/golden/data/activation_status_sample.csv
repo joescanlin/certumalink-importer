@@ -1,0 +1,7 @@
+npi,activation_status,profile_url,display_name,specialty,practice_zip,last_seen_at
+1000000001,rox_contacted,https://www.certumalink.com/doctors/a-1000000001,Dr A,Dermatology,78701,2026-06-01T10:00:00+00:00
+1000000002,,https://www.certumalink.com/doctors/b-1000000002,Dr B,Cardiology,78701,2026-06-02T10:00:00+00:00
+1000000003,interested,https://www.certumalink.com/doctors/c-1000000003,Dr C,Family Medicine,78701,2026-06-03T10:00:00+00:00
+1000000004,activated,https://www.certumalink.com/doctors/d-1000000004,Dr D,Urology,78701,2026-06-04T10:00:00+00:00
+1000000001,draft_profile_created,https://www.certumalink.com/doctors/a-1000000001,Dr A,Dermatology,78701,2026-06-05T10:00:00+00:00
+,email_sent,https://www.certumalink.com/doctors/x-0,No NPI,Nope,78701,2026-06-06T10:00:00+00:00
