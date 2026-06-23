@@ -19,5 +19,14 @@ services:
     volumes:
       - certuma_pgdata:/var/lib/postgresql/data
 
+  # Isolated Mailpit for Certuma Reach dev/tests (own ports; the certumalocal stack's Mailpit
+  # on 11025/18025 is left untouched). SMTP 11026, web/API 18026.
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: certuma-mailpit
+    ports:
+      - "11026:1025"
+      - "18026:8025"
+
 volumes:
   certuma_pgdata:
