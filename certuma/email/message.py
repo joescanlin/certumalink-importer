@@ -2,8 +2,9 @@
 
 build_outbound sets the RFC 8058 one-click List-Unsubscribe headers. to_mime renders the
 multipart MIME (text + html) with From display name and plus-addressed Reply-To. The body must
-already contain the rendered unsubscribe link, postal address, and claim_url (rendered upstream;
-the linter validates them) - this layer does not invent body content.
+already contain the rendered unsubscribe link, postal address, and claim_url (rendered and
+pre-linted upstream). This layer does not invent or re-validate body content; the SENDER applies
+a cheap last-line presence guard.
 """
 from __future__ import annotations
 
