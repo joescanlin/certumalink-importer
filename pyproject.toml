@@ -10,6 +10,17 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
 
+# certuma_core (pure) and certuma (app) are developed in-tree at the repo root and run via
+# PYTHONPATH / the Makefile venv for now; the `app` extra pins their runtime deps. Formal
+# packaging of those two packages is a later task (keeps the existing importer install intact).
+[project.optional-dependencies]
+app = [
+    "SQLAlchemy>=2.0,<2.1",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
+]
+dev = ["pytest>=8"]
+
 [project.scripts]
 certumalink-nppes = "certumalink_importer.cli:main"
 

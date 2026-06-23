@@ -1,0 +1,23 @@
+# Local + CI Postgres for Certuma Reach (Phase 0 task C2).
+# Local dev only: the credentials here are non-secret. Production DSN/secrets come
+# from the secret store via certuma/config.py, never from this file.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: certuma-db
+    environment:
+      POSTGRES_USER: certuma
+      POSTGRES_PASSWORD: certuma
+      POSTGRES_DB: certuma
+    ports:
+      - "55433:5432"   # isolated host port (55432 is taken by the existing certumalocal stack)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U certuma -d certuma"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - certuma_pgdata:/var/lib/postgresql/data
+
+volumes:
+  certuma_pgdata:
