@@ -133,6 +133,41 @@ class ReportingTests(unittest.TestCase):
         reporting.rebuild(self.session, as_of=WHEN)  # full rebuild again -> same, not doubled
         self.assertEqual(self._scalar("SELECT count(*) FROM reporting.dim_clinician"), first)
 
+    def test_customer_intelligence_queries(self):
+        from certuma.reporting import queries as rq
+        npi = "2500000003"
+        self.session.add(Prospect(npi=npi, display_name="Dr CI", primary_specialty="Dermatology",
+                                  practice_state="TX"))
+        self.session.flush()
+        lead = Lead(npi=npi, campaign="dermatology", activation_status="physician_activated",
+                    activation_detected_at=WHEN)
+        self.session.add(lead)
+        self.session.flush()
+        self.session.add(Message(lead_id=lead.id, npi=npi, campaign="dermatology", cadence_step=0,
+                                 direction="outbound", sent_at=WHEN, delivered=True, esp_message_id="o-ci"))
+        self.session.flush()
+        reporting.rebuild(self.session, as_of=WHEN)
+
+        f = rq.funnel_totals(self.session)
+        self.assertGreaterEqual(f["universe"], 1)
+        self.assertGreaterEqual(f["sent"], 1)
+        self.assertGreaterEqual(f["activated"], 1)
+        self.assertIsNotNone(f["activation_rate"])
+
+        spec = {r["label"]: r for r in rq.by_dimension(self.session, "specialty")}
+        self.assertIn("Dermatology", spec)
+        self.assertGreaterEqual(spec["Dermatology"]["activated"], 1)
+
+        eco = rq.unit_economics(self.session)
+        self.assertGreaterEqual(eco["activations"], 1)
+        self.assertIsNotNone(eco["cost_per_activation"])
+
+        # time to activation: sent and activated at the same instant -> 0 days
+        self.assertEqual(rq.time_to_activation_days(self.session), 0.0)
+
+        with self.assertRaises(ValueError):
+            rq.by_dimension(self.session, "drop_table")  # only whitelisted dimensions
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
