@@ -109,8 +109,12 @@ class OrchestratorTests(unittest.TestCase):
                                        practice_group_size=5, model_version="t"))
         if with_contact:
             self.session.add(Contact(npi=npi, email=f"dr.{npi}@example.com", email_status="valid"))
+        # a unique address per lead so the fixture never collides with other (possibly committed)
+        # mailbox rows; deactivate any pre-existing active mailbox first so pick_mailbox is
+        # deterministic for this transaction
+        self.session.execute(update(Mailbox).values(is_active=False))
         if with_mailbox:
-            self.session.add(Mailbox(address="jordan@getcertuma.com", display_name="Jordan Avery",
+            self.session.add(Mailbox(address=f"mbx-{npi}@getcertuma.com", display_name="Jordan Avery",
                                      domain="getcertuma.com", is_active=True))
         lead = Lead(npi=npi, campaign=campaign, activation_status="sendable", claim_url=CLAIM)
         self.session.add(lead)

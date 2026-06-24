@@ -182,7 +182,7 @@ class DashboardTests(unittest.TestCase):
         self.session.execute(_update(Template).where(Template.campaign.is_(None), Template.version == 1)
                              .values(is_approved=True))
         self.session.add(Contact(npi=npi, email=f"dr.{npi}@example.com", email_status="valid"))
-        self.session.add(Mailbox(address="jordan@getcertuma.com", domain="getcertuma.com", is_active=True))
+        self.session.add(Mailbox(address=f"mbx-{npi}@getcertuma.com", domain="getcertuma.com", is_active=True))
         lead = Lead(npi=npi, campaign="dermatology", activation_status="sendable", claim_url=CLAIM)
         self.session.add(lead)
         self.session.flush()
