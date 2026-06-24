@@ -11,9 +11,26 @@ from typing import Mapping
 from .models import DoctorRecord
 from .util import clean
 
-__all__ = ["DEFAULT_BASE_URL", "slugify", "profile_slug", "profile_url", "claim_urls_by_npi"]
+__all__ = [
+    "DEFAULT_BASE_URL", "slugify", "profile_slug", "profile_url", "claim_urls_by_npi",
+    "unsubscribe_url", "unsubscribe_mailto",
+]
 
 DEFAULT_BASE_URL = "https://www.certumalink.com"
+
+
+def unsubscribe_url(domain: str, npi: str) -> str:
+    """The deterministic per-recipient one-click unsubscribe URL (RFC 8058 List-Unsubscribe target).
+
+    Derived purely from the cold-sending domain + npi so the copywriter (at draft time) and the
+    orchestrator (reconstructing an approved draft at send time) produce byte-identical URLs.
+    """
+    return f"https://{domain}/u/{npi}"
+
+
+def unsubscribe_mailto(domain: str) -> str:
+    """The mailto: half of the List-Unsubscribe pair."""
+    return f"mailto:unsubscribe@{domain}"
 
 
 def slugify(value: str) -> str:

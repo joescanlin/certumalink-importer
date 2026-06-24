@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from certuma_core import campaigns, linter
+from certuma_core import campaigns, linter, urls
 from certuma_core.copy_schema import SeedFacts, allowlist_sources
 from certuma.config import Settings, get_settings
 from certuma.db.models import Lead, Prospect, Template, WorkflowScore
@@ -98,8 +98,8 @@ def draft_email(
 
     claim_url = lead.claim_url or ""
     domain = settings.cold_domain or "localhost"
-    unsubscribe_url = f"https://{domain}/u/{lead.npi}"
-    unsubscribe_mailto = f"mailto:unsubscribe@{domain}"
+    unsubscribe_url = urls.unsubscribe_url(domain, lead.npi)
+    unsubscribe_mailto = urls.unsubscribe_mailto(domain)
     postal = settings.postal_address
     sender_identity = f"{settings.sender_from_name} {settings.sender_from_title}".strip()
     sources = allowlist_sources(facts, template_prose=template.body, sender_identity=sender_identity)
