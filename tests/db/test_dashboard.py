@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover
     HAVE_DEPS = False
 
 if HAVE_DEPS:
+    from certuma import reply_drafter
     from certuma.config import Settings
     from certuma.api.app import create_app, get_db
     from certuma.db.models import (Approval, Campaign, Contact, Event, Lead, Mailbox, Message,
@@ -274,6 +275,41 @@ class DashboardTests(unittest.TestCase):
         for marker in ("Conversion funnel", "Emails sent", "Recent events", "Lead status",
                        "physician_activated", "opt_out", "delivered"):
             self.assertIn(marker, r.text)
+
+    # ---- Escalations (Phase 2) ----
+    def test_escalations_page_shows_drafted_reply(self):
+        npi = "1000000007"
+        self.session.add(Prospect(npi=npi, display_name="Dr Escalate", last_name="Escalate",
+                                  primary_specialty="Dermatology", practice_city="Austin"))
+        self.session.flush()
+        lead = Lead(npi=npi, campaign="dermatology", activation_status="needs_review", claim_url=CLAIM)
+        self.session.add(lead)
+        self.session.flush()
+        self.session.add(Message(lead_id=lead.id, npi=npi, campaign="dermatology", cadence_step=0,
+                                 direction="inbound", body_rendered="how much does this cost?",
+                                 esp_message_id="in-esc", reply_classification="objection"))
+        self.session.flush()
+        reply_drafter.draft_pending_replies(self.session, settings=SETTINGS)
+        r = self.client.get("/escalations")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Escalations", "Replies to handle", "Suggested response", "Approve reply",
+                       "Dr Escalate", "how much does this cost?"):
+            self.assertIn(marker, r.text)
+
+    def test_reply_approval_is_marked_without_sending(self):
+        npi = "1000000008"
+        self.session.add(Prospect(npi=npi, display_name="Dr Noemail"))
+        self.session.flush()
+        lead = Lead(npi=npi, campaign="dermatology", activation_status="needs_review")
+        self.session.add(lead)
+        self.session.flush()
+        appr = Approval(lead_id=lead.id, proposed_action="reply", gate_reason_code="objection",
+                        proposed_subject="Re: your profile", proposed_body="...", state="pending")
+        self.session.add(appr)
+        self.session.flush()
+        body = self.client.post(f"/approvals/{appr.id}/decision", json={"decision": "approved"}).json()
+        self.assertEqual(body["state"], "approved")
+        self.assertIsNone(body["send"])  # a reply approval is not auto-sent
 
     # ---- Agent Studio (Phase 2) ----
     def test_agents_page_renders_workflow_and_roster(self):
