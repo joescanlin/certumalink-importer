@@ -246,6 +246,51 @@ class OrchestratorTests(unittest.TestCase):
         self.session.refresh(lead)
         self.assertEqual(lead.activation_status, "sendable")  # unchanged
 
+    # ---- autonomy auto-executor (P2.6) ----
+    def _autonomy(self, level):
+        self.session.execute(update(Campaign).where(Campaign.name == "dermatology")
+                             .values(autonomy_level=level))
+
+    def test_auto_execute_supervised_sends_routine_value(self):
+        lead = self._seed("1700004001", priority="medium")
+        orchestrator.propose_sends(self.session, provider=StubCopyProvider(), settings=SETTINGS, when=BUSINESS)
+        self._autonomy("supervised")
+        s = orchestrator.auto_execute_pending(self.session, provider_email=CaptureEmailProvider(),
+                                              settings=SETTINGS, when=BUSINESS)
+        self.assertEqual((s.auto_sent, s.escalated), (1, 0))
+        self.session.refresh(lead)
+        self.assertEqual(lead.activation_status, "email_sent")
+
+    def test_auto_execute_supervised_escalates_high_value(self):
+        lead = self._seed("1700004002", priority="high")
+        orchestrator.propose_sends(self.session, provider=StubCopyProvider(), settings=SETTINGS, when=BUSINESS)
+        self._autonomy("supervised")
+        s = orchestrator.auto_execute_pending(self.session, provider_email=CaptureEmailProvider(),
+                                              settings=SETTINGS, when=BUSINESS)
+        self.assertEqual((s.auto_sent, s.escalated), (0, 1))
+        self.session.refresh(lead)
+        self.assertEqual(lead.activation_status, "sendable")     # untouched, waiting for a human
+        self.assertIsNotNone(self._pending(lead.id))             # still pending
+
+    def test_auto_execute_assisted_escalates_everything(self):
+        lead = self._seed("1700004003", priority="low")
+        orchestrator.propose_sends(self.session, provider=StubCopyProvider(), settings=SETTINGS, when=BUSINESS)
+        self._autonomy("assisted")
+        s = orchestrator.auto_execute_pending(self.session, provider_email=CaptureEmailProvider(),
+                                              settings=SETTINGS, when=BUSINESS)
+        self.assertEqual((s.auto_sent, s.escalated), (0, 1))
+        self.assertIsNotNone(self._pending(lead.id))
+
+    def test_auto_execute_autonomous_sends_high_value(self):
+        lead = self._seed("1700004004", priority="high")
+        orchestrator.propose_sends(self.session, provider=StubCopyProvider(), settings=SETTINGS, when=BUSINESS)
+        self._autonomy("autonomous")
+        s = orchestrator.auto_execute_pending(self.session, provider_email=CaptureEmailProvider(),
+                                              settings=SETTINGS, when=BUSINESS)
+        self.assertEqual(s.auto_sent, 1)
+        self.session.refresh(lead)
+        self.assertEqual(lead.activation_status, "email_sent")
+
     # ---- SLA ----
     def test_expire_stale_approvals(self):
         lead = self._seed("1700003011")

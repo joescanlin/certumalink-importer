@@ -32,7 +32,7 @@ from typing import List, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from certuma import gate, ledger_writer
+from certuma import gate, ledger_writer, policy
 from certuma.config import Settings, get_settings
 from certuma.copywriter import draft_email
 from certuma.db.models import Approval, Campaign, Contact, Lead, Mailbox, WorkflowScore
@@ -43,8 +43,9 @@ from certuma_core.status import IllegalTransition
 
 __all__ = [
     "OrchestratorError", "NotApproved", "NoValidContact", "NoMailbox",
-    "ProposeResult", "propose_sends", "execute_approved_send", "expire_stale_approvals",
-    "pick_contact", "pick_mailbox", "DEFAULT_SLA_HOURS",
+    "ProposeResult", "AutoExecuteSummary", "propose_sends", "execute_approved_send",
+    "auto_execute_pending", "expire_stale_approvals", "pick_contact", "pick_mailbox",
+    "DEFAULT_SLA_HOURS",
 ]
 
 _LOG = get_logger("certuma.orchestrator")
@@ -212,6 +213,67 @@ def execute_approved_send(
     emit(_LOG, "approved_send", approval_id=approval.id, lead_id=lead.id, npi=lead.npi,
          sent=outcome.sent, reason_code=(outcome.decision.reason_code if outcome.decision else None))
     return outcome
+
+
+@dataclass
+class AutoExecuteSummary:
+    auto_sent: int = 0
+    escalated: int = 0
+    failed: int = 0
+
+
+def auto_execute_pending(
+    session: Session,
+    *,
+    provider_email,
+    settings: Optional[Settings] = None,
+    when: Optional[datetime] = None,
+    limit: int = 200,
+) -> AutoExecuteSummary:
+    """Auto-approve + send the pending proposals the autonomy policy clears; leave the rest for a human.
+
+    For each pending Approval, policy.decide(campaign autonomy, value_tier) is AUTO_SEND or ESCALATE.
+    AUTO_SEND ones are approved by the system and run through execute_approved_send (so the FULL Gate
+    still runs). A transient HOLD reverts the proposal to pending (retried next tick); a terminal BLOCK
+    leaves it approved-but-unsent (the lead is suppressed). ESCALATE ones stay pending for the human.
+    Caller owns the transaction.
+    """
+    settings = settings or get_settings()
+    when = _now(when)
+    rows = session.execute(
+        select(Approval, Campaign.autonomy_level)
+        .join(Lead, Approval.lead_id == Lead.id)
+        .join(Campaign, Lead.campaign == Campaign.name)
+        .where(Approval.state == "pending")
+        .order_by(Approval.created_at).limit(limit)
+    ).all()
+
+    summary = AutoExecuteSummary()
+    for approval, autonomy in rows:
+        if policy.decide(autonomy, approval.value_tier) == policy.ESCALATE:
+            summary.escalated += 1
+            continue
+        approval.state = "approved"      # decided_by stays NULL = the system decided
+        approval.decided_at = when
+        try:
+            outcome = execute_approved_send(
+                session, approval, provider_email=provider_email, settings=settings, when=when)
+        except OrchestratorError:
+            summary.failed += 1
+            continue
+        if outcome.sent:
+            summary.auto_sent += 1
+        elif outcome.terminal:
+            summary.failed += 1          # BLOCK (suppression): leave approved, lead stopped
+        else:
+            approval.state = "pending"   # HOLD (quiet hours / cap): retry on a later tick
+            approval.decided_at = None
+            summary.failed += 1
+    session.flush()
+    METRICS.incr("auto_execute_run")
+    emit(_LOG, "auto_execute_run", auto_sent=summary.auto_sent, escalated=summary.escalated,
+         failed=summary.failed)
+    return summary
 
 
 def expire_stale_approvals(session: Session, *, when: Optional[datetime] = None) -> int:
