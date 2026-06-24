@@ -116,8 +116,8 @@ class AgentUpdateBody(BaseModel):
 _TIER_CLASS = {"high": "tier-live", "medium": "tier-review", "low": "tier-new"}
 _AUTONOMY_LEVELS = ("assisted", "supervised", "autonomous")
 # nav: (label, path). Only implemented screens are listed so there are no dead links.
-_NAV = (("Approvals", "/"), ("Campaigns", "/campaigns"), ("Templates", "/studio"),
-        ("Agents", "/agents"), ("Activity", "/activity"))
+_NAV = (("Approvals", "/"), ("Escalations", "/escalations"), ("Campaigns", "/campaigns"),
+        ("Templates", "/studio"), ("Agents", "/agents"), ("Activity", "/activity"))
 
 # The agent workflow, for the Agent Studio diagram: (lane, [(name, kind, model, role)]).
 # kind 'llm' = a tunable Claude agent (teal); 'node' = a deterministic step (no prompt).
@@ -509,6 +509,69 @@ def _agents_body(db: Session) -> str:
     {new_form}"""
 
 
+def _escalations_body(db: Session) -> str:
+    # 1. drafted objection/question replies waiting for a human
+    reply_rows = db.execute(
+        select(Approval, Prospect)
+        .join(Lead, Approval.lead_id == Lead.id)
+        .join(Prospect, Lead.npi == Prospect.npi)
+        .where(Approval.state == "pending", Approval.proposed_action == "reply")
+        .order_by(Approval.created_at)
+    ).all()
+    reply_cards = []
+    for a, p in reply_rows:
+        name = p.display_name or " ".join(x for x in (p.first_name, p.last_name) if x) or p.npi
+        inbound_msg = db.execute(
+            select(Message).where(Message.lead_id == a.lead_id, Message.direction == "inbound")
+            .order_by(Message.id.desc()).limit(1)).scalar()
+        their_reply = html.escape(inbound_msg.body_rendered) if (inbound_msg and inbound_msg.body_rendered) else ""
+        reply_cards.append(f"""
+        <div class="card" data-appr="{a.id}">
+          <div class="card-head">
+            <span class="av">{html.escape(_initials(name))}</span>
+            <div class="who"><div class="name">{html.escape(name)}</div>
+              <div class="sub">replied with a {html.escape(a.gate_reason_code or 'question')}</div></div>
+            <span class="chip-tier tier-review">needs a human</span>
+          </div>
+          <div class="proposed"><div class="subj">Their reply</div>
+            <div class="body">{their_reply}</div></div>
+          <div class="proposed"><div class="subj">Suggested response <span class="chip-tier tier-ai">AI draft</span></div>
+            <div class="body">{html.escape(a.proposed_body or '')}</div></div>
+          <div class="actions">
+            <button class="btn btn-primary" onclick="decide({a.id},'approved')">Approve reply</button>
+            <button class="btn btn-danger" onclick="decide({a.id},'rejected')">Reject</button>
+          </div>
+        </div>""")
+
+    # 2. needs_review leads that do not yet have a drafted reply (wrong-person, lint failures, etc.)
+    drafted_lead_ids = {a.lead_id for a, _ in reply_rows}
+    nr_rows = db.execute(
+        select(Lead, Prospect).join(Prospect, Lead.npi == Prospect.npi)
+        .where(Lead.activation_status == "needs_review").order_by(Lead.id)
+    ).all()
+    nr_items = []
+    for lead, p in nr_rows:
+        if lead.id in drafted_lead_ids:
+            continue
+        name = p.display_name or " ".join(x for x in (p.first_name, p.last_name) if x) or p.npi
+        nr_items.append(
+            f'<tr><td><div class="cell-title">{html.escape(name)}</div>'
+            f'<div class="t-meta">NPI {html.escape(p.npi)}</div></td>'
+            f'<td><span class="pill pill-warn">needs review</span></td></tr>')
+    nr_table = ("".join(nr_items) if nr_items
+                else '<tr><td colspan="2" class="empty-cell">Nothing else needs review.</td></tr>')
+
+    reply_section = ("".join(reply_cards) if reply_cards
+                     else '<div class="empty">No replies waiting for a response.</div>')
+    return f"""
+    <div class="section-title"><h2>Replies to handle</h2>
+      <span class="t-meta">{len(reply_cards)} drafted, awaiting your approval</span></div>
+    {reply_section}
+    <div class="section-title" style="margin-top:24px"><h2>Other items needing review</h2></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>Lead</th><th>Status</th></tr></thead><tbody>{nr_table}</tbody></table></div>"""
+
+
 def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(title="Certuma Reach dashboard", version="0.2")
@@ -520,6 +583,13 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
                       subtitle="Review each AI-drafted message. Approving sends it through the "
                                "compliance gate to the physician.",
                       body=_approvals_body(db))
+
+    @app.get("/escalations", response_class=HTMLResponse)
+    def escalations_page(db: Session = Depends(get_db)):
+        return _shell(db, "/escalations", eyebrow="Human in the loop", title="Escalations",
+                      subtitle="Replies the agents drafted for your approval, and anything else that "
+                               "needs a human.",
+                      body=_escalations_body(db))
 
     @app.get("/campaigns", response_class=HTMLResponse)
     def campaigns_page(db: Session = Depends(get_db)):
@@ -630,7 +700,9 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
         appr.decided_at = func.now()
 
         send = None
-        if body.decision == "approved":
+        # 'reply' approvals (drafted objection responses) are human-handled, not auto-sent: the
+        # threaded-reply send path is intentionally not wired (see reply_drafter). Mark state only.
+        if body.decision == "approved" and appr.proposed_action != "reply":
             provider = email_provider or get_provider(settings)
             try:
                 outcome = orchestrator.execute_approved_send(
