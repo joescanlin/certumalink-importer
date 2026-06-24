@@ -332,8 +332,23 @@ class CircuitBreakerState(Base):
     updated_at = Column(_TS, server_default=func.now())
 
 
+class Agent(Base):
+    """An editable LLM-agent config (Agent Studio, Phase 2). One active row per role; the providers
+    fall back to their in-code default prompt when none exists."""
+    __tablename__ = "agent"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    role = Column(Text, nullable=False)       # 'copywriter' | 'classifier' | 'reply_drafter'
+    name = Column(Text, nullable=False)
+    model = Column(Text, nullable=False, default="")
+    system_prompt = Column(Text, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=False)
+    version = Column(Integer, nullable=False, default=1)
+    created_by = Column(Text)
+    created_at = Column(_TS, server_default=func.now())
+
+
 ALL_TABLES = [
     "practice_group", "app_user", "campaign", "prospect", "contact", "workflow_score",
     "lead", "thread", "message", "event", "suppression", "template", "approval",
-    "audit_log", "kill_switch", "mailbox", "circuit_breaker_state",
+    "audit_log", "kill_switch", "mailbox", "circuit_breaker_state", "agent",
 ]

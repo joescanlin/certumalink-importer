@@ -275,6 +275,36 @@ class DashboardTests(unittest.TestCase):
                        "physician_activated", "opt_out", "delivered"):
             self.assertIn(marker, r.text)
 
+    # ---- Agent Studio (Phase 2) ----
+    def test_agents_page_renders_workflow_and_roster(self):
+        r = self.client.get("/agents")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Agent Studio", "Workflow", "Copywriter", "Reply Classifier",
+                       "Compliance Gate", "Claim Poller", "Spin up a fresh agent",
+                       "saveAgent(", "Haiku"):
+            self.assertIn(marker, r.text)
+
+    def test_agent_create_update_activate_endpoints(self):
+        from certuma.db.models import Agent
+        created = self.client.post("/agents", json={
+            "role": "copywriter", "name": "Warm derm", "model": "claude-sonnet-4-6",
+            "system_prompt": "Be warm and concise.", "activate": True}).json()
+        aid = created["id"]
+        self.assertTrue(created["is_active"])
+        # update bumps the version
+        upd = self.client.post(f"/agents/{aid}", json={"system_prompt": "Be warmer."}).json()
+        self.assertEqual(upd["version"], 2)
+        a = self.session.get(Agent, aid)
+        self.session.refresh(a)
+        self.assertEqual(a.system_prompt, "Be warmer.")
+        # activate is idempotent + 404s on a missing agent
+        self.assertEqual(self.client.post(f"/agents/{aid}/activate").status_code, 200)
+        self.assertEqual(self.client.post("/agents/999999/activate").status_code, 404)
+
+    def test_agent_create_validates(self):
+        self.assertEqual(self.client.post("/agents", json={
+            "role": "nope", "name": "x", "system_prompt": "y"}).status_code, 400)
+
     # ---- inbound reply webhook (Phase 2) ----
     def test_inbound_reply_classifies_and_transitions(self):
         npi = "1000000006"
