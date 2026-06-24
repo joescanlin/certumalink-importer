@@ -469,6 +469,39 @@ class DashboardTests(unittest.TestCase):
         # an unknown token still returns a pixel, harmlessly
         self.assertEqual(self.client.get("/track/open/nope").status_code, 200)
 
+    # ---- ESP inbound adapter + webhook secret (Phase 3 P3.10) ----
+    def test_inbound_esp_webhook_adapter(self):
+        npi = "1000000012"
+        self.session.add(Prospect(npi=npi, display_name="Dr Esp"))
+        self.session.flush()
+        lead = Lead(npi=npi, campaign="dermatology", activation_status="awaiting_reply", claim_url=CLAIM)
+        self.session.add(lead)
+        self.session.flush()
+        self.session.add(Thread(lead_id=lead.id, reply_token="esptok-1"))
+        self.session.add(Message(lead_id=lead.id, npi=npi, campaign="dermatology", cadence_step=0,
+                                 direction="outbound", subject="s", esp_message_id="o-esp"))
+        self.session.flush()
+        r = self.client.post("/inbound/esp", json={
+            "to": "reply+esptok-1@getcertuma.com", "text": "Yes, I'd like to claim",
+            "message_id": "esp-in-1", "from": "dr@example.com"})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["matched"])
+        self.assertEqual(body["intent"], "interested")
+        # a payload without our reply token is reported unmatched, not an error
+        self.assertFalse(self.client.post("/inbound/esp", json={"to": "x@y.com"}).json()["matched"])
+
+    def test_webhook_secret_lets_a_machine_post_events(self):
+        app = create_app(settings=Settings(session_secret=TEST_SECRET, webhook_secret="wh-secret"))
+        app.dependency_overrides[get_db] = self._override
+        c = TestClient(app)  # NO session cookie (a machine, not a user)
+        self.assertEqual(c.post("/events/email", json={"event_type": "opened", "dedup_key": "w1"}).status_code, 401)
+        ok = c.post("/events/email", json={"event_type": "opened", "dedup_key": "w2"},
+                    headers={"X-Certuma-Webhook-Secret": "wh-secret"})
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(c.post("/events/email", json={"event_type": "opened", "dedup_key": "w3"},
+                                headers={"X-Certuma-Webhook-Secret": "wrong"}).status_code, 401)
+
     # ---- inbound reply webhook (Phase 2) ----
     def test_inbound_reply_classifies_and_transitions(self):
         npi = "1000000006"

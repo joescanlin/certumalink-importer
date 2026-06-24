@@ -13,6 +13,7 @@ IMAP/ESP-webhook adapter) feeds. Caller owns the transaction.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Tuple
@@ -26,7 +27,27 @@ from certuma.classifier import ClassifyOutcome, classify_reply
 from certuma.db.models import Lead, Message, Thread
 from certuma.observability import METRICS, emit, get_logger
 
-__all__ = ["InboundResult", "ingest_reply", "handle_reply"]
+__all__ = ["InboundResult", "ingest_reply", "handle_reply", "parse_esp_inbound"]
+
+# the plus-addressed reply token: reply+<token>@domain
+_TOKEN_RE = re.compile(r"reply\+([^@\s>]+)@", re.IGNORECASE)
+
+
+def parse_esp_inbound(payload: dict) -> Optional[dict]:
+    """Normalize a generic ESP/IMAP inbound-reply payload to handle_reply kwargs, or None if it does
+    not carry our plus-addressed reply token. The exact provider field names map here at integration
+    (P3.10): we read the recipient (to/recipient/delivered_to), the body (text/body/plain), the
+    message id, and the sender."""
+    to = str(payload.get("to") or payload.get("recipient") or payload.get("delivered_to") or "")
+    match = _TOKEN_RE.search(to)
+    if not match:
+        return None
+    return {
+        "reply_token": match.group(1),
+        "text": payload.get("text") or payload.get("body") or payload.get("plain") or "",
+        "esp_message_id": str(payload.get("message_id") or payload.get("id") or ""),
+        "from_email": payload.get("from") or payload.get("sender") or "",
+    }
 
 _LOG = get_logger("certuma.inbound")
 

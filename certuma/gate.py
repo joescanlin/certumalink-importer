@@ -25,6 +25,7 @@ from certuma.config import Settings
 from certuma.db.models import Campaign, KillSwitch, Message, Prospect, Suppression
 from certuma.observability import METRICS, emit, get_logger
 from certuma_core.quiet_hours import is_quiet_hours
+from certuma_core.warmup import warmup_cap
 
 __all__ = ["ALLOW", "HOLD", "BLOCK", "GateDecision", "evaluate", "is_suppressed", "operational_hold"]
 
@@ -82,7 +83,9 @@ def _over_warmup_cap(session: Session, mailbox, when_utc: datetime) -> bool:
             Message.mailbox_id == mailbox.id, Message.sent_at.isnot(None), Message.sent_at >= start
         )
     ).scalar()
-    return sent >= mailbox.daily_cap
+    # a new mailbox ramps up gradually (P3.10) instead of allowing its full target cap on day one
+    age_days = (when_utc - mailbox.created_at).total_seconds() / 86400.0 if mailbox.created_at else None
+    return sent >= warmup_cap(mailbox.daily_cap, age_days)
 
 
 def _is_suppressed(session: Session, npi: Optional[str], email: Optional[str]) -> bool:

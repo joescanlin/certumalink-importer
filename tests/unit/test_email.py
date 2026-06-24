@@ -98,5 +98,52 @@ class MailpitRoundtripTests(unittest.TestCase):
         self.assertIn(subject, subjects)
 
 
+class _FakeResp:
+    def __init__(self, body, status=200, headers=None):
+        self._body = body.encode("utf-8")
+        self.status = status
+        self.headers = headers or {}
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class EspProviderTests(unittest.TestCase):
+    """The cold ESP send seam (P3.10), exercised with an injected opener (no network)."""
+
+    def test_send_via_injected_opener(self):
+        captured = {}
+
+        def opener(request, timeout=None):
+            captured["url"] = request.full_url
+            captured["auth"] = request.headers.get("Authorization")
+            return _FakeResp(json.dumps({"id": "esp-123"}))
+
+        provider = EspProvider(Settings(esp_api_key="k3y", esp_base_url="https://esp.example.com"),
+                               opener=opener)
+        res = provider.send(_outbound())
+        self.assertTrue(res.accepted)
+        self.assertEqual(res.provider_message_id, "esp-123")
+        self.assertIn("/v1/messages", captured["url"])
+        self.assertEqual(captured["auth"], "Bearer k3y")
+
+    def test_http_error_is_not_accepted(self):
+        import urllib.error
+
+        def opener(request, timeout=None):
+            raise urllib.error.HTTPError(request.full_url, 500, "boom", {}, None)
+
+        res = EspProvider(Settings(esp_api_key="k", esp_base_url="https://esp.example.com"),
+                          opener=opener).send(_outbound())
+        self.assertFalse(res.accepted)
+        self.assertIn("500", res.detail or "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
