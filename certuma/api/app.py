@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func, select, update
@@ -29,10 +29,14 @@ from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
 from certuma.reporting import queries as _rq
 from certuma.db.models import (Approval, Campaign, Event, KillSwitch, Lead, Message, Prospect,
-                               Suppression, Template)
+                               Suppression, Template, Thread)
 from certuma.db.session import make_session_factory
 from certuma.email import get_provider
 from certuma.templates import TemplateNotFound, approve_template, lint_template
+
+# a 1x1 transparent GIF returned by the open-tracking pixel endpoint
+_PIXEL_GIF = (b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00"
+              b"\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;")
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _FONTS = ("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800"
@@ -838,6 +842,19 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
             "suppressed": result.suppressed,
             "activated": result.activated,
         }
+
+    @app.get("/track/open/{token}")
+    def track_open(token: str, db: Session = Depends(get_db)):
+        # the open-tracking pixel: map the token back to a lead and record a (weak) opened event
+        thread = db.execute(select(Thread).where(Thread.reply_token == token)).scalar()
+        if thread is not None:
+            now = datetime.now(timezone.utc)
+            monitor.ingest_event(db, event_type="opened",
+                                 dedup_key=f"open:{token}:{now.date().isoformat()}",
+                                 occurred_at=now, lead_id=thread.lead_id)
+            db.commit()
+        return Response(content=_PIXEL_GIF, media_type="image/gif",
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
     @app.post("/inbound/reply")
     def inbound_reply(body: ReplyBody, db: Session = Depends(get_db)):

@@ -35,6 +35,7 @@ from certuma import gate, ledger_writer
 from certuma.config import Settings, get_settings
 from certuma.db.models import Lead, Message, Thread
 from certuma.email import build_outbound
+from certuma_core import urls
 from certuma.observability import METRICS, emit, get_logger
 
 __all__ = ["RenderedEmail", "SendOutcome", "ensure_thread", "send_one"]
@@ -114,9 +115,14 @@ def send_one(
     reply_domain = settings.reply_to_domain or settings.cold_domain or "localhost"
     reply_to = f"reply+{thread.reply_token}@{reply_domain}"
 
+    # embed the open-tracking pixel (P3.5); the token maps a fetch back to this lead's thread
+    pixel_domain = settings.cold_domain or "localhost"
+    html_body = rendered.body + (
+        f'<img src="{urls.open_pixel_url(pixel_domain, thread.reply_token)}" width="1" height="1" alt="">')
+
     outbound = build_outbound(
         to_addr=to_email, from_addr=settings.sender_from_email, from_name=settings.sender_from_name,
-        subject=rendered.subject, html_body=rendered.body, text_body=rendered.plaintext,
+        subject=rendered.subject, html_body=html_body, text_body=rendered.plaintext,
         reply_to=reply_to, unsubscribe_url=rendered.unsubscribe_url, unsubscribe_mailto=rendered.unsubscribe_mailto,
     )
 

@@ -381,6 +381,30 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.client.post("/agents", json={
             "role": "nope", "name": "x", "system_prompt": "y"}).status_code, 400)
 
+    # ---- open tracking (Phase 3 P3.5) ----
+    def test_open_pixel_tracks_engagement(self):
+        npi = "1000000011"
+        self.session.add(Prospect(npi=npi, display_name="Dr Opener"))
+        self.session.flush()
+        lead = Lead(npi=npi, campaign="dermatology", activation_status="awaiting_reply")
+        self.session.add(lead)
+        self.session.flush()
+        self.session.add(Thread(lead_id=lead.id, reply_token="otok-1"))
+        self.session.flush()
+        r = self.client.get("/track/open/otok-1")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["content-type"], "image/gif")
+        self.session.refresh(lead)
+        self.assertEqual(lead.open_count, 1)
+        self.assertIsNotNone(lead.last_open_at)
+        self.assertEqual(lead.activation_status, "awaiting_reply")  # an open never moves the lead
+        # a second open the same day is deduped (still 1)
+        self.client.get("/track/open/otok-1")
+        self.session.refresh(lead)
+        self.assertEqual(lead.open_count, 1)
+        # an unknown token still returns a pixel, harmlessly
+        self.assertEqual(self.client.get("/track/open/nope").status_code, 200)
+
     # ---- inbound reply webhook (Phase 2) ----
     def test_inbound_reply_classifies_and_transitions(self):
         npi = "1000000006"

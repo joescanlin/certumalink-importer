@@ -165,6 +165,9 @@ class Lead(Base):
     last_polled_at = Column(_TS)
     activation_detected_at = Column(_TS)
     needs_reenrich = Column(Boolean, nullable=False, default=False)  # set on hard bounce
+    open_count = Column(Integer, nullable=False, default=0)          # engagement rollup (P3.5)
+    last_open_at = Column(_TS)
+    last_engaged_at = Column(_TS)                                    # any inbound signal (open or reply)
     version = Column(Integer, nullable=False, default=0)
     last_seen_at = Column(_TS)
     created_at = Column(_TS, server_default=func.now())
