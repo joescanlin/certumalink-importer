@@ -212,6 +212,39 @@ class DashboardTests(unittest.TestCase):
             # the only non-suppressed HOLD possible for this clean lead is quiet hours (wall clock)
             self.assertEqual(send["reason_code"], "quiet_hours")
 
+    # ---- kill-switch control on the shell ----
+    def test_kill_toggle_control_reflects_state(self):
+        page = self.client.get("/").text
+        self.assertIn("toggleKill(true)", page)        # offer to pause when clear
+        self.assertIn("Pause all sending", page)
+        self.client.post("/kill-switch", json={"active": True})
+        page = self.client.get("/").text
+        self.assertIn("toggleKill(false)", page)       # offer to resume when active
+        self.assertIn("Resume sending", page)
+        self.assertIn("banner live", page)             # the active-kill banner shows
+
+    # ---- campaigns screen ----
+    def test_campaigns_page_renders(self):
+        r = self.client.get("/campaigns")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Campaigns", "Autonomy", "dermatology", "campaignSet", "Activate"):
+            self.assertIn(marker, r.text)
+
+    def test_campaign_config_endpoint_updates(self):
+        r = self.client.post("/campaigns/dermatology",
+                             json={"is_active": True, "autonomy_level": "supervised"})
+        self.assertEqual(r.status_code, 200)
+        camp = self.session.get(Campaign, "dermatology")
+        self.session.refresh(camp)
+        self.assertTrue(camp.is_active)
+        self.assertEqual(camp.autonomy_level, "supervised")
+
+    def test_campaign_config_validates(self):
+        self.assertEqual(
+            self.client.post("/campaigns/dermatology", json={"autonomy_level": "wat"}).status_code, 400)
+        self.assertEqual(self.client.post("/campaigns/dermatology", json={}).status_code, 400)
+        self.assertEqual(self.client.post("/campaigns/nope", json={"is_active": True}).status_code, 404)
+
     # ---- inbound event webhook ----
     def test_event_webhook_drives_lifecycle(self):
         npi = "1000000004"
