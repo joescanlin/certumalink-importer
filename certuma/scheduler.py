@@ -22,7 +22,7 @@ from typing import Callable, Optional
 
 from sqlalchemy.orm import Session
 
-from certuma import cadence, orchestrator, poller
+from certuma import cadence, enrichment, orchestrator, poller
 from certuma.config import Settings, get_settings
 from certuma.observability import METRICS, emit, get_logger
 
@@ -33,6 +33,7 @@ _LOG = get_logger("certuma.scheduler")
 
 @dataclass
 class TickReport:
+    enriched: int = 0
     proposed: int = 0
     auto_sent: int = 0
     escalated: int = 0
@@ -43,6 +44,7 @@ class TickReport:
 
     def lines(self) -> list:
         return [
+            f"enriched     : {self.enriched}",
             f"proposed     : {self.proposed}",
             f"auto-sent    : {self.auto_sent}   escalated to human: {self.escalated}",
             f"cadence sent : {self.cadence_sent}   exhausted: {self.cadence_exhausted}",
@@ -59,11 +61,17 @@ def tick(
     settings: Optional[Settings] = None,
     when: Optional[datetime] = None,
     claim_fetch: Optional[Callable[[str], str]] = None,
+    discovery=None,
+    verify=None,
 ) -> TickReport:
     """Run one full pass of the autonomous loop. Caller owns the transaction."""
     settings = settings or get_settings()
     when = when or datetime.now(timezone.utc)
     report = TickReport()
+
+    if discovery is not None and verify is not None:  # step 0: enrich raw leads into sendable ones
+        report.enriched = enrichment.run_enrichment(
+            session, discovery=discovery, verify=verify, settings=settings, when=when).enriched
 
     p = orchestrator.propose_sends(session, provider=copy_provider, settings=settings, when=when)
     report.proposed = p.proposed
