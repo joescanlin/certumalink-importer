@@ -195,6 +195,8 @@ class Message(Base):
     subject = Column(Text)
     body_rendered = Column(Text)
     esp_message_id = Column(Text)
+    in_reply_to = Column(BigInteger, ForeignKey("message.id"))  # inbound -> the outbound it answers
+    reply_classification = Column(Text)  # the classifier intent on an inbound message (P2.2)
     sent_at = Column(_TS)
     delivered = Column(Boolean, nullable=False, default=False)
     bounced = Column(Boolean, nullable=False, default=False)

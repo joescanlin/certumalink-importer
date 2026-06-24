@@ -38,7 +38,8 @@ from certuma.ledger_writer import IllegalActor, transition
 from certuma.observability import METRICS, emit, get_logger
 from certuma_core.status import IllegalTransition
 
-__all__ = ["IngestResult", "record_event", "ingest_event", "activate_lead"]
+__all__ = ["IngestResult", "record_event", "ingest_event", "activate_lead",
+           "suppress", "try_transition"]
 
 _LOG = get_logger("certuma.monitor")
 
@@ -151,6 +152,12 @@ def _try_transition(session: Session, lead: Lead, new_status: str, *, actor: str
         emit(_LOG, "monitor_transition_skipped", lead_id=lead.id,
              frm=lead.activation_status, to=new_status, reason_code=reason_code)
         return False
+
+
+# Public aliases so the reply classifier (P2.2) records suppressions and transitions through the
+# exact same compliance-critical paths as the deterministic monitor (one implementation).
+suppress = _suppress
+try_transition = _try_transition
 
 
 def activate_lead(
