@@ -63,6 +63,12 @@ class PauseBody(BaseModel):
     paused: bool
 
 
+class CampaignConfigBody(BaseModel):
+    is_active: Optional[bool] = None
+    is_paused: Optional[bool] = None
+    autonomy_level: Optional[str] = None
+
+
 class DecisionBody(BaseModel):
     decision: str  # approved | rejected | edited
     decided_by: Optional[int] = None
@@ -84,6 +90,9 @@ class EmailEventBody(BaseModel):
 
 
 _TIER_CLASS = {"high": "tier-live", "medium": "tier-review", "low": "tier-new"}
+_AUTONOMY_LEVELS = ("assisted", "supervised", "autonomous")
+# nav: (label, path). Only implemented screens are listed so there are no dead links.
+_NAV = (("Approvals", "/"), ("Campaigns", "/campaigns"))
 
 
 def _initials(name: str) -> str:
@@ -91,64 +100,25 @@ def _initials(name: str) -> str:
     return ((parts[0][0] + parts[-1][0]) if len(parts) >= 2 else (parts[0][:2] if parts else "Dr")).upper()
 
 
-def _render_index(db: Session) -> str:
+def _pending_count(db: Session) -> int:
+    return db.execute(select(func.count()).select_from(Approval).where(Approval.state == "pending")).scalar()
+
+
+def _shell(db: Session, active_path: str, *, eyebrow: str, title: str, subtitle: str, body: str) -> str:
+    """Render a console page: sidebar + nav + topbar (with the global kill-switch toggle) + body."""
     kill = bool(db.execute(select(KillSwitch.is_active).where(KillSwitch.id == 1)).scalar())
-    pending = db.execute(select(func.count()).select_from(Approval).where(Approval.state == "pending")).scalar()
-    leads = db.execute(select(func.count()).select_from(Lead)).scalar()
-    activated = db.execute(
-        select(func.count()).select_from(Lead).where(Lead.activation_status == "physician_activated")
-    ).scalar()
-    suppressions = db.execute(select(func.count()).select_from(Suppression)).scalar()
-
-    rows = db.execute(
-        select(Approval, Prospect)
-        .join(Lead, Approval.lead_id == Lead.id)
-        .join(Prospect, Lead.npi == Prospect.npi)
-        .where(Approval.state == "pending")
-        .order_by(Approval.created_at)
-    ).all()
-
-    cards = []
-    for a, p in rows:
-        name = p.display_name or " ".join(x for x in (p.first_name, p.last_name) if x) or p.npi
-        meta = " - ".join(x for x in (p.primary_specialty, p.practice_city, p.practice_state) if x)
-        tier = (a.value_tier or "new").lower()
-        tier_cls = _TIER_CLASS.get(tier, "tier-new")
-        subj = html.escape(a.proposed_subject or "(no subject)")
-        body = html.escape(a.proposed_body or "")
-        cards.append(f"""
-        <div class="card" data-appr="{a.id}">
-          <div class="card-head">
-            <span class="av">{html.escape(_initials(name))}</span>
-            <div class="who">
-              <div class="name">{html.escape(name)}</div>
-              <div class="sub">{html.escape(meta or 'NPI ' + p.npi)}</div>
-            </div>
-            <span class="chip-tier {tier_cls}">{html.escape(tier)} value</span>
-            <span class="chip-tier tier-ai">AI draft</span>
-          </div>
-          <div class="proposed">
-            <div class="subj">{subj}</div>
-            <div class="body">{body}</div>
-          </div>
-          <div class="actions">
-            <button class="btn btn-primary" onclick="decide({a.id},'approved')">Approve &amp; send</button>
-            <button class="btn btn-danger" onclick="decide({a.id},'rejected')">Reject</button>
-          </div>
-        </div>""")
-
-    queue = "".join(cards) if cards else (
-        '<div class="empty">No proposals waiting. The queue is clear.</div>')
-
-    nav = [("Approvals", True, pending), ("Campaigns", False, None), ("Templates", False, None),
-           ("Activity", False, None), ("Settings", False, None)]
+    pending = _pending_count(db)
     nav_html = "".join(
-        f'<a class="nav-item{" active" if active else ""}" href="#">'
+        f'<a class="nav-item{" active" if path == active_path else ""}" href="{path}">'
         f'<span class="dot"></span><span>{label}</span>'
-        f'{f"<span class=nav-count>{count}</span>" if count else ""}</a>'
-        for label, active, count in nav
+        f'{f"<span class=nav-count>{pending}</span>" if (label == "Approvals" and pending) else ""}</a>'
+        for label, path in _NAV
     )
-
+    kill_btn = (
+        f'<button class="btn {"btn-danger" if not kill else "btn-secondary"}" '
+        f'onclick="toggleKill({str(not kill).lower()})">'
+        f'{"Pause all sending" if not kill else "Resume sending"}</button>'
+    )
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -169,11 +139,88 @@ def _render_index(db: Session) -> str:
     <div id="kill-banner" class="banner{' live' if kill else ''}">
       Kill switch is ACTIVE. No emails will send until it is cleared.
     </div>
-    <div class="page-head">
-      <div class="t-eyebrow">Assisted outreach</div>
-      <h1>Approvals</h1>
-      <p>Review each AI-drafted message. Approving sends it through the compliance gate to the physician.</p>
+    <div class="head-row">
+      <div class="page-head">
+        <div class="t-eyebrow">{html.escape(eyebrow)}</div>
+        <h1>{html.escape(title)}</h1>
+        <p>{html.escape(subtitle)}</p>
+      </div>
+      <div class="controls">{kill_btn}</div>
     </div>
+    {body}
+    <div class="foot">Certuma Reach - internal Assisted outreach. Every send is human-approved.</div>
+  </main>
+</div>
+<script>
+async function _post(url, payload) {{
+  try {{
+    const r = await fetch(url, {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(payload)}});
+    if (r.ok) {{ location.reload(); return true; }}
+  }} catch (e) {{}}
+  alert('Action failed');
+  return false;
+}}
+async function decide(id, decision) {{
+  const card = document.querySelector('[data-appr="' + id + '"]');
+  if (card) card.querySelectorAll('button').forEach(b => b.disabled = true);
+  if (!await _post('/approvals/' + id + '/decision', {{decision: decision}})) {{
+    if (card) card.querySelectorAll('button').forEach(b => b.disabled = false);
+  }}
+}}
+function toggleKill(active) {{ _post('/kill-switch', {{active: active}}); }}
+function campaignSet(name, field, value) {{
+  const payload = {{}}; payload[field] = value;
+  _post('/campaigns/' + encodeURIComponent(name), payload);
+}}
+</script>
+</body></html>"""
+
+
+def _approvals_body(db: Session) -> str:
+    pending = _pending_count(db)
+    leads = db.execute(select(func.count()).select_from(Lead)).scalar()
+    activated = db.execute(
+        select(func.count()).select_from(Lead).where(Lead.activation_status == "physician_activated")
+    ).scalar()
+    suppressions = db.execute(select(func.count()).select_from(Suppression)).scalar()
+
+    rows = db.execute(
+        select(Approval, Prospect)
+        .join(Lead, Approval.lead_id == Lead.id)
+        .join(Prospect, Lead.npi == Prospect.npi)
+        .where(Approval.state == "pending")
+        .order_by(Approval.created_at)
+    ).all()
+
+    cards = []
+    for a, p in rows:
+        name = p.display_name or " ".join(x for x in (p.first_name, p.last_name) if x) or p.npi
+        meta = " - ".join(x for x in (p.primary_specialty, p.practice_city, p.practice_state) if x)
+        tier = (a.value_tier or "new").lower()
+        tier_cls = _TIER_CLASS.get(tier, "tier-new")
+        cards.append(f"""
+        <div class="card" data-appr="{a.id}">
+          <div class="card-head">
+            <span class="av">{html.escape(_initials(name))}</span>
+            <div class="who">
+              <div class="name">{html.escape(name)}</div>
+              <div class="sub">{html.escape(meta or 'NPI ' + p.npi)}</div>
+            </div>
+            <span class="chip-tier {tier_cls}">{html.escape(tier)} value</span>
+            <span class="chip-tier tier-ai">AI draft</span>
+          </div>
+          <div class="proposed">
+            <div class="subj">{html.escape(a.proposed_subject or '(no subject)')}</div>
+            <div class="body">{html.escape(a.proposed_body or '')}</div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary" onclick="decide({a.id},'approved')">Approve &amp; send</button>
+            <button class="btn btn-danger" onclick="decide({a.id},'rejected')">Reject</button>
+          </div>
+        </div>""")
+    queue = "".join(cards) if cards else '<div class="empty">No proposals waiting. The queue is clear.</div>'
+    return f"""
     <div class="kpis">
       <div class="kpi"><div class="v">{pending}</div><div class="k">Pending approvals</div></div>
       <div class="kpi"><div class="v">{leads}</div><div class="k">Leads in pipeline</div></div>
@@ -181,26 +228,51 @@ def _render_index(db: Session) -> str:
       <div class="kpi"><div class="v">{suppressions}</div><div class="k">Suppressed</div></div>
     </div>
     <div class="section-title"><h2>Proposal queue</h2><span class="t-meta">{pending} waiting</span></div>
-    {queue}
-    <div class="foot">Certuma Reach - internal Assisted outreach. Every send is human-approved.</div>
-  </main>
-</div>
-<script>
-async function decide(id, decision) {{
-  const card = document.querySelector('[data-appr="' + id + '"]');
-  if (card) card.querySelectorAll('button').forEach(b => b.disabled = true);
-  try {{
-    const r = await fetch('/approvals/' + id + '/decision', {{
-      method: 'POST', headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{decision: decision}})
-    }});
-    if (r.ok) {{ location.reload(); return; }}
-  }} catch (e) {{}}
-  alert('Action failed');
-  if (card) card.querySelectorAll('button').forEach(b => b.disabled = false);
-}}
-</script>
-</body></html>"""
+    {queue}"""
+
+
+def _campaigns_body(db: Session) -> str:
+    camps = db.execute(select(Campaign).order_by(Campaign.name)).scalars().all()
+    counts = dict(db.execute(select(Lead.campaign, func.count()).group_by(Lead.campaign)).all())
+    rows = []
+    for c in camps:
+        if not c.name:  # skip the '' sentinel campaign
+            continue
+        opts = "".join(
+            f'<option value="{lvl}"{" selected" if c.autonomy_level == lvl else ""}>{lvl}</option>'
+            for lvl in _AUTONOMY_LEVELS
+        )
+        active_pill = ('<span class="pill pill-on">active</span>' if c.is_active
+                       else '<span class="pill pill-off">inactive</span>')
+        paused_pill = ('<span class="pill pill-warn">paused</span>' if c.is_paused
+                       else '<span class="pill pill-on">running</span>')
+        nm = html.escape(c.name)
+        rows.append(f"""
+        <tr>
+          <td><div class="cell-title">{html.escape(c.label or c.name)}</div>
+              <div class="t-meta">{nm}</div></td>
+          <td>{active_pill}</td>
+          <td>{paused_pill}</td>
+          <td class="tabular">{counts.get(c.name, 0)}</td>
+          <td><select class="sel" onchange="campaignSet('{nm}','autonomy_level',this.value)">{opts}</select></td>
+          <td class="row-actions">
+            <button class="btn btn-sm btn-secondary" onclick="campaignSet('{nm}','is_active',{str(not c.is_active).lower()})">
+              {"Deactivate" if c.is_active else "Activate"}</button>
+            <button class="btn btn-sm btn-secondary" onclick="campaignSet('{nm}','is_paused',{str(not c.is_paused).lower()})">
+              {"Resume" if c.is_paused else "Pause"}</button>
+          </td>
+        </tr>""")
+    body = "".join(rows) if rows else '<tr><td colspan="6" class="empty-cell">No campaigns.</td></tr>'
+    return f"""
+    <div class="card pad0">
+      <table class="tbl">
+        <thead><tr><th>Campaign</th><th>Active</th><th>Sending</th><th>Leads</th>
+          <th>Autonomy</th><th></th></tr></thead>
+        <tbody>{body}</tbody>
+      </table>
+    </div>
+    <div class="t-meta" style="margin-top:12px">Autonomy: assisted = every send human-approved
+      (supervised / autonomous are Phase 2).</div>"""
 
 
 def create_app(settings=None, email_provider=None) -> FastAPI:
@@ -210,7 +282,16 @@ def create_app(settings=None, email_provider=None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def index(db: Session = Depends(get_db)):
-        return _render_index(db)
+        return _shell(db, "/", eyebrow="Assisted outreach", title="Approvals",
+                      subtitle="Review each AI-drafted message. Approving sends it through the "
+                               "compliance gate to the physician.",
+                      body=_approvals_body(db))
+
+    @app.get("/campaigns", response_class=HTMLResponse)
+    def campaigns_page(db: Session = Depends(get_db)):
+        return _shell(db, "/campaigns", eyebrow="Configuration", title="Campaigns",
+                      subtitle="Activate, pause, and set the autonomy level for each outreach campaign.",
+                      body=_campaigns_body(db))
 
     @app.get("/health")
     def health(db: Session = Depends(get_db)):
@@ -315,6 +396,19 @@ def create_app(settings=None, email_provider=None) -> FastAPI:
             raise HTTPException(status_code=404, detail="campaign not found")
         db.commit()
         return {"campaign": name, "is_paused": body.paused}
+
+    @app.post("/campaigns/{name}")
+    def update_campaign(name: str, body: CampaignConfigBody, db: Session = Depends(get_db)):
+        values = {k: v for k, v in body.model_dump().items() if v is not None}
+        if not values:
+            raise HTTPException(status_code=400, detail="no fields to update")
+        if "autonomy_level" in values and values["autonomy_level"] not in _AUTONOMY_LEVELS:
+            raise HTTPException(status_code=400, detail="invalid autonomy_level")
+        result = db.execute(update(Campaign).where(Campaign.name == name).values(**values))
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="campaign not found")
+        db.commit()
+        return {"campaign": name, **values}
 
     @app.get("/templates")
     def list_templates(db: Session = Depends(get_db)):
