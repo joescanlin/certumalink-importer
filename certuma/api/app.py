@@ -24,7 +24,8 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from certuma import gate, monitor, orchestrator
+from certuma import gate, inbound, monitor, orchestrator
+from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
 from certuma.db.models import (Approval, Campaign, Event, KillSwitch, Lead, Message, Prospect,
                                Suppression, Template)
@@ -88,6 +89,14 @@ class EmailEventBody(BaseModel):
     npi: Optional[str] = None
     email: Optional[str] = None
     payload: Optional[dict] = None
+
+
+class ReplyBody(BaseModel):
+    reply_token: str
+    text: str
+    esp_message_id: str
+    from_email: Optional[str] = None
+    occurred_at: Optional[str] = None
 
 
 _TIER_CLASS = {"high": "tier-live", "medium": "tier-review", "low": "tier-new"}
@@ -383,7 +392,7 @@ def _activity_body(db: Session) -> str:
     </div>"""
 
 
-def create_app(settings=None, email_provider=None) -> FastAPI:
+def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(title="Certuma Reach dashboard", version="0.2")
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
@@ -497,6 +506,25 @@ def create_app(settings=None, email_provider=None) -> FastAPI:
             "transitioned_to": result.transitioned_to,
             "suppressed": result.suppressed,
             "activated": result.activated,
+        }
+
+    @app.post("/inbound/reply")
+    def inbound_reply(body: ReplyBody, db: Session = Depends(get_db)):
+        occurred = (datetime.fromisoformat(body.occurred_at) if body.occurred_at
+                    else datetime.now(timezone.utc))
+        res, outcome = inbound.handle_reply(
+            db, reply_token=body.reply_token, text=body.text, esp_message_id=body.esp_message_id,
+            from_email=body.from_email, occurred_at=occurred,
+            classifier=classifier or StubReplyClassifier(),
+        )
+        db.commit()
+        return {
+            "matched": res.matched,
+            "duplicate": res.duplicate,
+            "lead_id": res.lead_id,
+            "intent": outcome.intent if outcome else None,
+            "transitioned_to": outcome.transitioned_to if outcome else res.transitioned_to,
+            "escalated": outcome.escalated if outcome else False,
         }
 
     @app.post("/kill-switch")

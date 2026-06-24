@@ -29,7 +29,7 @@ if HAVE_DEPS:
     from certuma.config import Settings
     from certuma.api.app import create_app, get_db
     from certuma.db.models import (Approval, Campaign, Contact, Event, Lead, Mailbox, Message,
-                                   Prospect, Suppression)
+                                   Prospect, Suppression, Thread)
     from certuma.email.provider import SendResult
 
 DB_URL = os.environ.get("CERTUMA_DATABASE_URL") or (Settings().database_url if HAVE_DEPS else "")
@@ -274,6 +274,30 @@ class DashboardTests(unittest.TestCase):
         for marker in ("Conversion funnel", "Emails sent", "Recent events", "Lead status",
                        "physician_activated", "opt_out", "delivered"):
             self.assertIn(marker, r.text)
+
+    # ---- inbound reply webhook (Phase 2) ----
+    def test_inbound_reply_classifies_and_transitions(self):
+        npi = "1000000006"
+        self.session.add(Prospect(npi=npi, display_name="Dr Reply", practice_state="TX"))
+        self.session.flush()
+        lead = Lead(npi=npi, campaign="dermatology", activation_status="awaiting_reply",
+                    claim_url=CLAIM)
+        self.session.add(lead)
+        self.session.flush()
+        self.session.add(Thread(lead_id=lead.id, reply_token="rtok-6"))
+        self.session.add(Message(lead_id=lead.id, npi=npi, campaign="dermatology", cadence_step=0,
+                                 direction="outbound", subject="s", esp_message_id="o-6"))
+        self.session.flush()
+        r = self.client.post("/inbound/reply", json={
+            "reply_token": "rtok-6", "text": "Yes, I'd like to claim my profile",
+            "esp_message_id": "reply-6"})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["matched"])
+        self.assertEqual(body["intent"], "interested")
+        self.assertEqual(body["transitioned_to"], "interested")
+        self.session.refresh(lead)
+        self.assertEqual(lead.activation_status, "interested")
 
     # ---- inbound event webhook ----
     def test_event_webhook_drives_lifecycle(self):
