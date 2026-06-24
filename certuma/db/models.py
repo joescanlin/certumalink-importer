@@ -347,8 +347,26 @@ class Agent(Base):
     created_at = Column(_TS, server_default=func.now())
 
 
+class ClinicianSignal(Base):
+    """One observed per-clinician signal (the knowledge graph, Phase 3). One current value per
+    (npi, signal_type, source); providers upsert. observed_at drives recency decay in scoring."""
+    __tablename__ = "clinician_signal"
+    __table_args__ = (
+        UniqueConstraint("npi", "signal_type", "source", name="uq_signal_npi_type_source"),
+    )
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    npi = Column(String(10), ForeignKey("prospect.npi"), nullable=False)
+    signal_type = Column(Text, nullable=False)
+    value = Column(Text)
+    numeric_value = Column(Numeric)
+    source = Column(Text, nullable=False, default="")
+    confidence = Column(Numeric(4, 3), nullable=False, default=1)
+    observed_at = Column(_TS, nullable=False)
+    created_at = Column(_TS, server_default=func.now())
+
+
 ALL_TABLES = [
     "practice_group", "app_user", "campaign", "prospect", "contact", "workflow_score",
     "lead", "thread", "message", "event", "suppression", "template", "approval",
-    "audit_log", "kill_switch", "mailbox", "circuit_breaker_state", "agent",
+    "audit_log", "kill_switch", "mailbox", "circuit_breaker_state", "agent", "clinician_signal",
 ]
