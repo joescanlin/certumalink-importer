@@ -12,8 +12,8 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 __all__ = [
-    "SignalView", "fit_score", "fit_tier", "recommend_action", "RECENCY_HALFLIFE_DAYS",
-    "GROUP_CAP", "PANEL_CAP",
+    "SignalView", "fit_score", "fit_tier", "recommend_action", "support_action",
+    "RECENCY_HALFLIFE_DAYS", "GROUP_CAP", "PANEL_CAP", "SUPPORT_ACTION_MAX_AGE_DAYS",
 ]
 
 # signal-type keys (mirror certuma.signals.provider; duplicated here to keep this module pure)
@@ -22,9 +22,16 @@ _MESSAGE_BURDEN = "message_burden"
 _PUBLIC_ACTIVITY = "public_activity"
 _PANEL_SIZE = "panel_size"
 
+# support-derived sales signals (mirror certuma.support.provider) - the support agents write these
+# into the same knowledge graph, so they fold straight into fit scoring and the recommended queue.
+_EXPANSION = "expansion_intent"
+_ADVOCATE = "advocate"
+_CHURN_SUPPORT = "churn_risk_support"
+
 GROUP_CAP = 20.0
 PANEL_CAP = 5000.0
 RECENCY_HALFLIFE_DAYS = 180.0  # a signal this old counts at ~half weight (linear floor 0.3)
+SUPPORT_ACTION_MAX_AGE_DAYS = 90.0  # a support signal older than this no longer drives a sales action
 
 
 @dataclass(frozen=True)
@@ -41,7 +48,11 @@ def _weight(sig: SignalView) -> float:
 
 
 def fit_score(signals: Dict[str, SignalView]) -> int:
-    """0-100 fit score from the knowledge-graph signals. Missing signals contribute nothing."""
+    """0-100 fit score from the knowledge-graph signals. Missing signals contribute nothing.
+
+    Support-derived signals shift the score so support interactions genuinely move sales priority:
+    an expansion question or a happy customer lifts fit, a support-flagged churn risk lowers it.
+    """
     score = 0.0
     g = signals.get(_GROUP_SIZE)
     if g and g.numeric is not None:
@@ -55,7 +66,33 @@ def fit_score(signals: Dict[str, SignalView]) -> int:
     p = signals.get(_PANEL_SIZE)
     if p and p.numeric is not None:
         score += min(p.numeric, PANEL_CAP) / PANEL_CAP * 25.0 * _weight(p)
-    return int(round(min(score, 100.0)))
+    # support-derived sales signals (bounded; a churn flag pulls fit down)
+    for key, points in ((_EXPANSION, 22.0), (_ADVOCATE, 12.0), (_CHURN_SUPPORT, -25.0)):
+        s = signals.get(key)
+        if s:
+            score += points * _weight(s)
+    return int(round(max(0.0, min(score, 100.0))))
+
+
+def _actionable(sig: Optional[SignalView]) -> bool:
+    """A support signal warrants a sales action only while it is recent and carries confidence -
+    otherwise a years-old support touch would re-admit a customer to the queue forever."""
+    return (sig is not None and sig.confidence > 0.0
+            and sig.age_days <= SUPPORT_ACTION_MAX_AGE_DAYS)
+
+
+def support_action(signals: Dict[str, SignalView]) -> Optional[Tuple[str, str, int]]:
+    """The sales next-best-action a recent support signal implies, with an urgency rank used to order
+    the queue (higher = more urgent). Churn outranks upsell outranks referral - handle the unhappy
+    customer first - and that ordering, not raw fit, is what should float these to the top. Stale or
+    zero-confidence signals no longer drive an action. Returns (action, reason, urgency) or None."""
+    if _actionable(signals.get(_CHURN_SUPPORT)):
+        return ("Retention outreach", "churn risk flagged in support", 2)
+    if _actionable(signals.get(_EXPANSION)):
+        return ("Upsell", "expansion interest from support", 1)
+    if _actionable(signals.get(_ADVOCATE)):
+        return ("Ask for referral", "happy customer (support advocate)", 1)
+    return None
 
 
 def fit_tier(score: int) -> str:

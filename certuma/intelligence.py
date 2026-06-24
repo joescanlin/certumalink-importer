@@ -13,7 +13,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from certuma.db.models import ClinicianSignal, Contact, Lead, Prospect
-from certuma_core.intelligence import SignalView, fit_score, fit_tier, recommend_action
+from certuma_core.intelligence import (SignalView, fit_score, fit_tier, recommend_action,
+                                       support_action)
 
 __all__ = ["OPEN_STATES", "recommended_actions"]
 
@@ -22,9 +23,16 @@ OPEN_STATES = (
     "not_contacted", "queued_today", "enriching", "sendable", "email_sent",
     "awaiting_reply", "replied", "interested", "needs_review",
 )
+# activated customers are "done" for outbound, but a support signal (upsell / churn / referral)
+# turns them back into a sales action - so they re-enter the recommended queue when, and only when,
+# support has surfaced an opportunity on them.
+_SUPPORT_REENTRY = ("physician_activated",)
 
 
 def _signals_for(session: Session, npi: str, when: datetime) -> Dict[str, SignalView]:
+    # keyed by signal_type alone; this assumes signal_type is globally unique across sources (the
+    # support types are disjoint from the provider types today). If that ever stops holding, key by
+    # (signal_type, source) instead, since the DB uniqueness is (npi, signal_type, source).
     out: Dict[str, SignalView] = {}
     for s in session.execute(
         select(ClinicianSignal).where(ClinicianSignal.npi == npi)
@@ -42,18 +50,26 @@ def recommended_actions(session: Session, *, when: Optional[datetime] = None, li
     when = when or datetime.now(timezone.utc)
     rows = session.execute(
         select(Lead, Prospect).join(Prospect, Lead.npi == Prospect.npi)
-        .where(Lead.activation_status.in_(OPEN_STATES))
+        .where(Lead.activation_status.in_(OPEN_STATES + _SUPPORT_REENTRY))
     ).all()
 
     out: List[dict] = []
     for lead, p in rows:
         signals = _signals_for(session, lead.npi, when)
+        sup = support_action(signals)
+        # an activated customer is only a sales action when support surfaced an opportunity on them
+        if lead.activation_status in _SUPPORT_REENTRY and sup is None:
+            continue
         score = fit_score(signals)
         has_contact = session.execute(
             select(Contact.id).where(Contact.npi == lead.npi, Contact.email_status == "valid").limit(1)
         ).first() is not None
         due = lead.next_action_at is not None and lead.next_action_at <= when
-        action, reason = recommend_action(lead.activation_status, has_contact=has_contact, due_now=due)
+        if sup is not None:
+            action, reason, urgency = sup  # a support signal takes precedence as the next best action
+        else:
+            action, reason = recommend_action(lead.activation_status, has_contact=has_contact, due_now=due)
+            urgency = 0
         out.append({
             "npi": lead.npi,
             "name": p.display_name or " ".join(x for x in (p.first_name, p.last_name) if x) or p.npi,
@@ -64,6 +80,10 @@ def recommended_actions(session: Session, *, when: Optional[datetime] = None, li
             "fit_tier": fit_tier(score),
             "action": action,
             "reason": reason,
+            "urgency": urgency,
         })
-    out.sort(key=lambda r: r["fit_score"], reverse=True)
+    # support-driven actions (esp. churn/retention, urgency 2) sort to the top regardless of fit, so a
+    # churning customer - whose fit the churn signal deliberately drives down - is never truncated off
+    # the bottom of the queue. Within an urgency band, rank by fit.
+    out.sort(key=lambda r: (r["urgency"], r["fit_score"]), reverse=True)
     return out[:limit]

@@ -16,11 +16,11 @@ from typing import Optional
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
-from certuma import reporting, signals
+from certuma import reporting, signals, support
 from certuma.config import Settings, get_settings
 from certuma.db.models import (Approval, Campaign, ClinicianSignal, Contact, Event, Lead, Mailbox,
-                               Message, PracticeGroup, Prospect, Suppression, Template, Thread,
-                               WorkflowScore)
+                               Message, PracticeGroup, Prospect, Suppression, SupportTicket, Template,
+                               Thread, WorkflowScore)
 from certuma_core.learning import assign_variant
 
 __all__ = ["seed_active", "main", "SPECIALTIES", "VARIANTS"]
@@ -76,6 +76,7 @@ def seed_active(session: Session, *, settings: Optional[Settings] = None, n: int
     session.flush()
 
     counts: dict = {}
+    support_candidates: list = []
     for i in range(n):
         npi = f"30{i:08d}"
         spec = SPECIALTIES[i % len(SPECIALTIES)]
@@ -88,7 +89,7 @@ def seed_active(session: Session, *, settings: Optional[Settings] = None, n: int
         variant = assign_variant(VARIANTS, npi)
 
         # clean prior + base rows (signals/events/etc. before the prospect they FK to)
-        for tbl in (ClinicianSignal, Event, Message, Contact, WorkflowScore):
+        for tbl in (ClinicianSignal, SupportTicket, Event, Message, Contact, WorkflowScore):
             session.execute(delete(tbl).where(tbl.npi == npi))
         session.execute(delete(Approval).where(Approval.lead_id.in_(select(Lead.id).where(Lead.npi == npi))))
         session.execute(delete(Thread).where(Thread.lead_id.in_(select(Lead.id).where(Lead.npi == npi))))
@@ -129,10 +130,63 @@ def seed_active(session: Session, *, settings: Optional[Settings] = None, n: int
         if sent:
             _seed_sent_lead(session, lead, npi, variant, status, when, postal, domain, campaign, i)
 
+        # activated physicians chat with support; a slice of still-onboarding leads ask setup questions
+        if status == "physician_activated":
+            support_candidates.append((npi, "activated"))
+        elif sent and status in ("email_sent", "interested", "awaiting_reply") and _pct(npi, "sup") < 30:
+            support_candidates.append((npi, "onboarding"))
+
     signals.run_signal_collection(session, when=when, limit=10_000)
+    tickets, summary = _seed_support(session, support_candidates, when)
+    counts["support_tickets"] = tickets
+    counts["support_signals"] = summary.signals_emitted
+    counts["support_escalations"] = summary.escalated
     reporting.rebuild(session, as_of=when)
     counts["total"] = n
     return counts
+
+
+# (subject, body) keyed to the intent the stub classifier will infer from the body keywords.
+# Order matters: indices 6 and 7 are the onboarding/how-to messages used for still-onboarding leads.
+_SUPPORT_MSGS = [
+    ("Can we add more seats?",
+     "We love this so far - can you add more seats for the other three providers in our group? We "
+     "want to expand to our whole practice."),
+    ("Thank you - this is fantastic",
+     "Just wanted to say I love it. The profile claim flow was so helpful, best onboarding I have had. "
+     "Thank you so much."),
+    ("Frustrated - considering canceling",
+     "I am frustrated and disappointed. If this cannot be sorted out I want to cancel and get a refund."),
+    ("Profile page is broken",
+     "There is a bug - my profile page is not loading and shows a 404 error. It does not work at all."),
+    ("Any plans to integrate with our EHR?",
+     "Would be great if you could integrate with our EHR. Any plans to add that feature?"),
+    ("Question about my invoice",
+     "I have a billing question about the latest charge on my subscription invoice - can you help?"),
+    ("Help claiming my profile",
+     "I need help to finish setup - where is my claim link so I can activate my profile?"),
+    ("How do I edit my listing?",
+     "How do I edit the specialties and hours shown on my listing?"),
+]
+
+
+def _seed_support(session, candidates, when):
+    """Create inbound support tickets for the candidates, then run the support pass to classify,
+    answer/escalate, and emit support-derived sales signals into the knowledge graph."""
+    created = 0
+    for npi, kind in candidates:
+        if kind == "activated":
+            idx = _pct(npi, "supmsg") % len(_SUPPORT_MSGS)        # full spread of intents
+        else:
+            idx = 6 + (_pct(npi, "supmsg") % 2)                   # onboarding_help / how_to
+        subject, body = _SUPPORT_MSGS[idx]
+        created_at = when - timedelta(days=(_pct(npi, "supage") % 12), hours=(_pct(npi, "suph") % 24))
+        session.add(SupportTicket(npi=npi, channel=("portal" if idx % 2 else "email"),
+                                  subject=subject, body=body, status="open", created_at=created_at))
+        created += 1
+    session.flush()
+    summary = support.run_support(session, when=when, limit=10_000)
+    return created, summary
 
 
 def _classify_phase(npi, variant, phase):

@@ -393,9 +393,29 @@ class AccessLog(Base):
     at = Column(_TS, server_default=func.now())
 
 
+class SupportTicket(Base):
+    """An inbound onboarding/support message the support agent classifies, answers/escalates, and
+    turns into a SALES signal in clinician_signal (Phase 4 / support)."""
+    __tablename__ = "support_ticket"
+    __table_args__ = (
+        CheckConstraint("status IN ('open','answered','escalated','resolved')", name="support_status_valid"),
+    )
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    npi = Column(String(10), ForeignKey("prospect.npi"))
+    channel = Column(Text, nullable=False, default="portal")
+    subject = Column(Text)
+    body = Column(Text, nullable=False)
+    intent = Column(Text)
+    status = Column(Text, nullable=False, default="open")
+    answer = Column(Text)
+    emitted_signal = Column(Text)
+    created_at = Column(_TS, server_default=func.now())
+    resolved_at = Column(_TS)
+
+
 ALL_TABLES = [
     "practice_group", "app_user", "campaign", "prospect", "contact", "workflow_score",
     "lead", "thread", "message", "event", "suppression", "template", "approval",
     "audit_log", "kill_switch", "mailbox", "circuit_breaker_state", "agent", "clinician_signal",
-    "console_user", "access_log",
+    "console_user", "access_log", "support_ticket",
 ]
