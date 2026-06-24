@@ -100,6 +100,21 @@ class SignalsTests(unittest.TestCase):
         self.assertIn(signals.MESSAGE_BURDEN, types)
         self.assertNotIn(signals.EHR, types)  # vendor provider not used
 
+    def test_recommended_actions_ranks_by_fit(self):
+        from certuma import intelligence
+        self._seed("2600000010")
+        self._seed("2600000011")
+        signals.run_signal_collection(self.session, when=WHEN)
+        recs = intelligence.recommended_actions(self.session, when=WHEN)
+        mine = [r for r in recs if r["npi"] in ("2600000010", "2600000011")]
+        self.assertEqual(len(mine), 2)
+        # the queue is ranked top-fit first
+        scores = [r["fit_score"] for r in recs]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        # a sendable lead's next best action is to send the first touch
+        self.assertEqual(mine[0]["action"], "Send first touch")
+        self.assertIn(mine[0]["fit_tier"], ("high", "medium", "low"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

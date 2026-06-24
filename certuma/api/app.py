@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from certuma import agents, gate, inbound, monitor, orchestrator, reporting
+from certuma import agents, gate, inbound, intelligence, monitor, orchestrator, reporting
 from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
 from certuma.reporting import queries as _rq
@@ -117,9 +117,9 @@ class AgentUpdateBody(BaseModel):
 _TIER_CLASS = {"high": "tier-live", "medium": "tier-review", "low": "tier-new"}
 _AUTONOMY_LEVELS = ("assisted", "supervised", "autonomous")
 # nav: (label, path). Only implemented screens are listed so there are no dead links.
-_NAV = (("Approvals", "/"), ("Escalations", "/escalations"), ("Campaigns", "/campaigns"),
-        ("Templates", "/studio"), ("Agents", "/agents"), ("Analytics", "/analytics"),
-        ("Activity", "/activity"))
+_NAV = (("Approvals", "/"), ("Recommended", "/recommended"), ("Escalations", "/escalations"),
+        ("Campaigns", "/campaigns"), ("Templates", "/studio"), ("Agents", "/agents"),
+        ("Analytics", "/analytics"), ("Activity", "/activity"))
 
 # The agent workflow, for the Agent Studio diagram: (lane, [(name, kind, model, role)]).
 # kind 'llm' = a tunable Claude agent (teal); 'node' = a deterministic step (no prompt).
@@ -591,6 +591,31 @@ def _dim_table(title: str, rows: list) -> str:
       <tbody>{body}</tbody></table></div>"""
 
 
+_FIT_CLASS = {"high": "tier-live", "medium": "tier-review", "low": "tier-new"}
+
+
+def _recommended_body(db: Session) -> str:
+    rows = intelligence.recommended_actions(db, limit=50)
+    items = []
+    for r in rows:
+        meta = " - ".join(x for x in (r["specialty"], r["state"]) if x)
+        items.append(
+            f'<tr><td><div class="cell-title">{html.escape(r["name"])}</div>'
+            f'<div class="t-meta">{html.escape(meta or "NPI " + r["npi"])}</div></td>'
+            f'<td><span class="chip-tier {_FIT_CLASS.get(r["fit_tier"], "tier-new")}">'
+            f'{r["fit_score"]} {html.escape(r["fit_tier"])}</span></td>'
+            f'<td class="t-meta">{html.escape(r["status"])}</td>'
+            f'<td><div class="cell-title">{html.escape(r["action"])}</div>'
+            f'<div class="t-meta">{html.escape(r["reason"])}</div></td></tr>')
+    body = "".join(items) if items else '<tr><td colspan="4" class="empty-cell">No open leads.</td></tr>'
+    return f"""
+    <div class="section-title"><h2>Recommended actions</h2>
+      <span class="t-meta">open leads ranked by fit (signals + trigger)</span></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>Clinician</th><th>Fit</th><th>Status</th><th>Next best action</th></tr></thead>
+      <tbody>{body}</tbody></table></div>"""
+
+
 def _analytics_body(db: Session) -> str:
     f = _rq.funnel_totals(db)
     eco = _rq.unit_economics(db)
@@ -644,6 +669,13 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
                       subtitle="Review each AI-drafted message. Approving sends it through the "
                                "compliance gate to the physician.",
                       body=_approvals_body(db))
+
+    @app.get("/recommended", response_class=HTMLResponse)
+    def recommended_page(db: Session = Depends(get_db)):
+        return _shell(db, "/recommended", eyebrow="Intelligence", title="Recommended actions",
+                      subtitle="Open leads ranked by fit (knowledge-graph signals), each with its "
+                               "next-best-action.",
+                      body=_recommended_body(db))
 
     @app.get("/escalations", response_class=HTMLResponse)
     def escalations_page(db: Session = Depends(get_db)):

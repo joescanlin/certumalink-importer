@@ -276,6 +276,22 @@ class DashboardTests(unittest.TestCase):
                        "physician_activated", "opt_out", "delivered"):
             self.assertIn(marker, r.text)
 
+    # ---- Recommended actions (Phase 3) ----
+    def test_recommended_page_ranks_open_leads(self):
+        from certuma import signals
+        npi = "1000000010"
+        self.session.add(Prospect(npi=npi, display_name="Dr Recommend", primary_specialty="Dermatology",
+                                  practice_state="TX"))
+        self.session.flush()
+        self.session.add(Lead(npi=npi, campaign="dermatology", activation_status="sendable"))
+        self.session.flush()
+        signals.run_signal_collection(self.session)
+        r = self.client.get("/recommended")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Recommended actions", "Next best action", "Fit", "Dr Recommend",
+                       "Send first touch"):
+            self.assertIn(marker, r.text)
+
     # ---- Analytics / Customer Intelligence (Phase 3) ----
     def test_analytics_rebuild_then_render(self):
         npi = "1000000009"
