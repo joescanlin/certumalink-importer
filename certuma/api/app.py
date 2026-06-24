@@ -24,7 +24,8 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from certuma import agents, gate, inbound, intelligence, monitor, orchestrator, reporting
+from certuma import (agents, engagement, gate, inbound, intelligence, monitor, orchestrator,
+                     reporting)
 from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
 from certuma.reporting import queries as _rq
@@ -423,6 +424,17 @@ def _activity_body(db: Session) -> str:
     def pct(n):
         return f"{round(100 * n / sent)}%" if sent else "-"
 
+    _STATE_PILL = {"churn_risk": "pill-warn", "went_quiet": "pill-warn", "opened_no_reply": "pill-on"}
+    eng_rows = "".join(
+        f'<tr><td><div class="cell-title">{html.escape(r["name"])}</div>'
+        f'<div class="t-meta">{html.escape(r["specialty"] or "NPI " + r["npi"])}</div></td>'
+        f'<td><span class="pill {_STATE_PILL.get(r["state"], "pill-off")}">'
+        f'{html.escape(r["state"].replace("_", " "))}</span></td>'
+        f'<td class="tabular">{r["open_count"]}</td>'
+        f'<td><div class="cell-title">{html.escape(r["play"] or "")}</div></td></tr>'
+        for r in engagement.engagement_queue(db, limit=25)
+    ) or '<tr><td colspan="4" class="empty-cell">No engagement plays right now.</td></tr>'
+
     return f"""
     <div class="section-title"><h2>Conversion funnel</h2></div>
     <div class="kpis">
@@ -439,6 +451,12 @@ def _activity_body(db: Session) -> str:
         <table class="tbl"><thead><tr><th>Recent suppressions</th><th></th></tr></thead>
           <tbody>{supp_rows}</tbody></table>
       </div>
+    </div>
+    <div class="section-title" style="margin-top:22px"><h2>Re-engage &amp; churn risk</h2>
+      <span class="t-meta">engagement signal plays</span></div>
+    <div class="card pad0">
+      <table class="tbl"><thead><tr><th>Clinician</th><th>Signal</th><th>Opens</th><th>Play</th></tr></thead>
+        <tbody>{eng_rows}</tbody></table>
     </div>
     <div class="section-title" style="margin-top:22px"><h2>Recent events</h2></div>
     <div class="card pad0">
