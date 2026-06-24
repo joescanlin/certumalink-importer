@@ -1,24 +1,39 @@
-"""Dashboard backend (Phase 0 skeleton).
+"""Dashboard backend + the Assisted-loop console (Phase 0 skeleton, Phase 1 P1.11 UI).
 
-Scope: a read-only pipeline/health view, the approval-queue read + decide stubs, and the
-global kill switch + per-campaign pause WIRED TO THE GATE (the load-bearing part: toggling the
-switch here changes what certuma.gate.evaluate returns before any future send). Everything else
-(funnel analytics, deliverability panel, template studio, real auth) is deferred to later phases.
+The internal sales lead's one screen. It renders the pending approval queue with the fully-drafted
+copy each physician will receive, and Approve fires the real send: POST /approvals/{id}/decision
+with decision=approved runs orchestrator.execute_approved_send (COPYWRITER draft -> Gate -> SENDER).
+The kill switch and per-campaign pause remain wired to the Gate (toggling them here changes what
+certuma.gate.evaluate returns before any future send). POST /events/email is the inbound webhook
+seam (provider/poller signals -> certuma.monitor.ingest_event).
+
+Styling matches the Certumalink platform (certuma/api/static/certuma.css, derived from the product
+design tokens) so the console reads as the same product as the doctor profiles.
 
 No `from __future__ import annotations` here so pydantic v2 sees real type objects on Python 3.9.
 """
+import html
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from certuma import gate
+from certuma import gate, monitor, orchestrator
+from certuma.config import get_settings
 from certuma.db.models import Approval, Campaign, KillSwitch, Lead, Prospect, Suppression, Template
 from certuma.db.session import make_session_factory
+from certuma.email import get_provider
 from certuma.templates import TemplateNotFound, approve_template, lint_template
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+_FONTS = ("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800"
+          "&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap")
 
 _SessionFactory = None
 
@@ -57,18 +72,145 @@ class ApproveTemplateBody(BaseModel):
     approved_by: str
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="Certuma Reach dashboard", version="0.1")
+class EmailEventBody(BaseModel):
+    event_type: str
+    dedup_key: str
+    occurred_at: Optional[str] = None
+    lead_id: Optional[int] = None
+    message_id: Optional[int] = None
+    npi: Optional[str] = None
+    email: Optional[str] = None
+    payload: Optional[dict] = None
+
+
+_TIER_CLASS = {"high": "tier-live", "medium": "tier-review", "low": "tier-new"}
+
+
+def _initials(name: str) -> str:
+    parts = [p for p in (name or "").replace(".", " ").split() if p and p[0].isalpha()]
+    return ((parts[0][0] + parts[-1][0]) if len(parts) >= 2 else (parts[0][:2] if parts else "Dr")).upper()
+
+
+def _render_index(db: Session) -> str:
+    kill = bool(db.execute(select(KillSwitch.is_active).where(KillSwitch.id == 1)).scalar())
+    pending = db.execute(select(func.count()).select_from(Approval).where(Approval.state == "pending")).scalar()
+    leads = db.execute(select(func.count()).select_from(Lead)).scalar()
+    activated = db.execute(
+        select(func.count()).select_from(Lead).where(Lead.activation_status == "physician_activated")
+    ).scalar()
+    suppressions = db.execute(select(func.count()).select_from(Suppression)).scalar()
+
+    rows = db.execute(
+        select(Approval, Prospect)
+        .join(Lead, Approval.lead_id == Lead.id)
+        .join(Prospect, Lead.npi == Prospect.npi)
+        .where(Approval.state == "pending")
+        .order_by(Approval.created_at)
+    ).all()
+
+    cards = []
+    for a, p in rows:
+        name = p.display_name or " ".join(x for x in (p.first_name, p.last_name) if x) or p.npi
+        meta = " - ".join(x for x in (p.primary_specialty, p.practice_city, p.practice_state) if x)
+        tier = (a.value_tier or "new").lower()
+        tier_cls = _TIER_CLASS.get(tier, "tier-new")
+        subj = html.escape(a.proposed_subject or "(no subject)")
+        body = html.escape(a.proposed_body or "")
+        cards.append(f"""
+        <div class="card" data-appr="{a.id}">
+          <div class="card-head">
+            <span class="av">{html.escape(_initials(name))}</span>
+            <div class="who">
+              <div class="name">{html.escape(name)}</div>
+              <div class="sub">{html.escape(meta or 'NPI ' + p.npi)}</div>
+            </div>
+            <span class="chip-tier {tier_cls}">{html.escape(tier)} value</span>
+            <span class="chip-tier tier-ai">AI draft</span>
+          </div>
+          <div class="proposed">
+            <div class="subj">{subj}</div>
+            <div class="body">{body}</div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary" onclick="decide({a.id},'approved')">Approve &amp; send</button>
+            <button class="btn btn-danger" onclick="decide({a.id},'rejected')">Reject</button>
+          </div>
+        </div>""")
+
+    queue = "".join(cards) if cards else (
+        '<div class="empty">No proposals waiting. The queue is clear.</div>')
+
+    nav = [("Approvals", True, pending), ("Campaigns", False, None), ("Templates", False, None),
+           ("Activity", False, None), ("Settings", False, None)]
+    nav_html = "".join(
+        f'<a class="nav-item{" active" if active else ""}" href="#">'
+        f'<span class="dot"></span><span>{label}</span>'
+        f'{f"<span class=nav-count>{count}</span>" if count else ""}</a>'
+        for label, active, count in nav
+    )
+
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Certuma Reach</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="{_FONTS}">
+<link rel="stylesheet" href="/static/certuma.css">
+</head><body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-logo">CR</span>
+      <div><div class="brand-name">Certuma Reach</div><div class="brand-sub">Sales console</div></div>
+    </div>
+    <nav class="nav">{nav_html}</nav>
+  </aside>
+  <main class="content">
+    <div id="kill-banner" class="banner{' live' if kill else ''}">
+      Kill switch is ACTIVE. No emails will send until it is cleared.
+    </div>
+    <div class="page-head">
+      <div class="t-eyebrow">Assisted outreach</div>
+      <h1>Approvals</h1>
+      <p>Review each AI-drafted message. Approving sends it through the compliance gate to the physician.</p>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><div class="v">{pending}</div><div class="k">Pending approvals</div></div>
+      <div class="kpi"><div class="v">{leads}</div><div class="k">Leads in pipeline</div></div>
+      <div class="kpi"><div class="v">{activated}</div><div class="k">Physicians activated</div></div>
+      <div class="kpi"><div class="v">{suppressions}</div><div class="k">Suppressed</div></div>
+    </div>
+    <div class="section-title"><h2>Proposal queue</h2><span class="t-meta">{pending} waiting</span></div>
+    {queue}
+    <div class="foot">Certuma Reach - internal Assisted outreach. Every send is human-approved.</div>
+  </main>
+</div>
+<script>
+async function decide(id, decision) {{
+  const card = document.querySelector('[data-appr="' + id + '"]');
+  if (card) card.querySelectorAll('button').forEach(b => b.disabled = true);
+  try {{
+    const r = await fetch('/approvals/' + id + '/decision', {{
+      method: 'POST', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{decision: decision}})
+    }});
+    if (r.ok) {{ location.reload(); return; }}
+  }} catch (e) {{}}
+  alert('Action failed');
+  if (card) card.querySelectorAll('button').forEach(b => b.disabled = false);
+}}
+</script>
+</body></html>"""
+
+
+def create_app(settings=None, email_provider=None) -> FastAPI:
+    settings = settings or get_settings()
+    app = FastAPI(title="Certuma Reach dashboard", version="0.2")
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
     @app.get("/", response_class=HTMLResponse)
-    def index():
-        return (
-            "<!doctype html><title>Certuma Reach</title>"
-            "<h1>Certuma Reach - dashboard skeleton</h1>"
-            "<p>Phase 0. Endpoints: "
-            "<a href='/health'>/health</a>, /approvals, /kill-switch, /campaigns/{name}/pause, "
-            "/gate/preview</p>"
-        )
+    def index(db: Session = Depends(get_db)):
+        return _render_index(db)
 
     @app.get("/health")
     def health(db: Session = Depends(get_db)):
@@ -122,8 +264,39 @@ def create_app() -> FastAPI:
         appr.state = body.decision
         appr.decided_by = body.decided_by
         appr.decided_at = func.now()
+
+        send = None
+        if body.decision == "approved":
+            provider = email_provider or get_provider(settings)
+            try:
+                outcome = orchestrator.execute_approved_send(
+                    db, appr, provider_email=provider, settings=settings)
+                send = {
+                    "sent": outcome.sent,
+                    "reason_code": outcome.decision.reason_code if outcome.decision else None,
+                    "esp_message_id": outcome.esp_message_id,
+                }
+            except orchestrator.OrchestratorError as exc:
+                send = {"sent": False, "error": type(exc).__name__}
         db.commit()
-        return {"id": approval_id, "state": body.decision}
+        return {"id": approval_id, "state": body.decision, "send": send}
+
+    @app.post("/events/email")
+    def email_event(body: EmailEventBody, db: Session = Depends(get_db)):
+        occurred = (datetime.fromisoformat(body.occurred_at) if body.occurred_at
+                    else datetime.now(timezone.utc))
+        result = monitor.ingest_event(
+            db, event_type=body.event_type, dedup_key=body.dedup_key, occurred_at=occurred,
+            lead_id=body.lead_id, message_id=body.message_id, npi=body.npi, email=body.email,
+            payload=body.payload,
+        )
+        db.commit()
+        return {
+            "duplicate": result.duplicate,
+            "transitioned_to": result.transitioned_to,
+            "suppressed": result.suppressed,
+            "activated": result.activated,
+        }
 
     @app.post("/kill-switch")
     def kill_switch(body: KillBody, db: Session = Depends(get_db)):
