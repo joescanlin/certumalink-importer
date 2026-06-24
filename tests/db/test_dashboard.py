@@ -28,7 +28,8 @@ except Exception:  # pragma: no cover
 if HAVE_DEPS:
     from certuma.config import Settings
     from certuma.api.app import create_app, get_db
-    from certuma.db.models import Approval, Campaign, Contact, Lead, Mailbox, Message, Prospect
+    from certuma.db.models import (Approval, Campaign, Contact, Event, Lead, Mailbox, Message,
+                                   Prospect, Suppression)
     from certuma.email.provider import SendResult
 
 DB_URL = os.environ.get("CERTUMA_DATABASE_URL") or (Settings().database_url if HAVE_DEPS else "")
@@ -244,6 +245,35 @@ class DashboardTests(unittest.TestCase):
             self.client.post("/campaigns/dermatology", json={"autonomy_level": "wat"}).status_code, 400)
         self.assertEqual(self.client.post("/campaigns/dermatology", json={}).status_code, 400)
         self.assertEqual(self.client.post("/campaigns/nope", json={"is_active": True}).status_code, 404)
+
+    # ---- template studio ----
+    def test_studio_page_renders(self):
+        r = self.client.get("/studio")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Template studio", "Run linter", "lintTemplate(", "approveTemplate("):
+            self.assertIn(marker, r.text)
+        self.assertIn("draft", r.text)  # the seeded placeholder template awaits approval
+
+    # ---- activity / funnel ----
+    def test_activity_page_renders_funnel(self):
+        from datetime import datetime, timezone
+        npi = "1000000005"
+        self.session.add(Prospect(npi=npi, display_name="Dr Funnel"))
+        self.session.flush()
+        lead = Lead(npi=npi, campaign="dermatology", activation_status="physician_activated")
+        self.session.add(lead)
+        self.session.flush()
+        self.session.add(Message(lead_id=lead.id, npi=npi, campaign="dermatology", cadence_step=1,
+                                 direction="outbound", subject="s", delivered=True))
+        self.session.add(Suppression(npi=npi, reason="opt_out"))
+        self.session.add(Event(dedup_key="act-ev-1", npi=npi, event_type="delivered",
+                               occurred_at=datetime(2026, 6, 23, 15, tzinfo=timezone.utc)))
+        self.session.flush()
+        r = self.client.get("/activity")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Conversion funnel", "Emails sent", "Recent events", "Lead status",
+                       "physician_activated", "opt_out", "delivered"):
+            self.assertIn(marker, r.text)
 
     # ---- inbound event webhook ----
     def test_event_webhook_drives_lifecycle(self):
