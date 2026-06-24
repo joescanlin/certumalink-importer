@@ -41,6 +41,9 @@ class Settings:
     enrich_api_key: str = ""          # discovery provider (healthcare-specialized / B2B)
     verify_api_key: str = ""          # email-verification provider
 
+    # --- dashboard auth (P3.9) ---
+    session_secret: str = ""          # CERTUMA_SESSION_SECRET; signs the session cookie
+
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
         e = os.environ if env is None else env
@@ -68,6 +71,7 @@ class Settings:
             postal_address=e.get("CERTUMA_POSTAL_ADDRESS", ""),
             enrich_api_key=e.get("CERTUMA_ENRICH_API_KEY", ""),
             verify_api_key=e.get("CERTUMA_VERIFY_API_KEY", ""),
+            session_secret=e.get("CERTUMA_SESSION_SECRET", ""),
         )
 
 

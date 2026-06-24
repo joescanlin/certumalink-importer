@@ -13,24 +13,28 @@ design tokens) so the console reads as the same product as the doctor profiles.
 No `from __future__ import annotations` here so pydantic v2 sees real type objects on Python 3.9.
 """
 import html
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, Response
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from certuma import (agents, engagement, gate, inbound, intelligence, learning, monitor,
+from certuma import (agents, auth, engagement, gate, inbound, intelligence, learning, monitor,
                      orchestrator, reporting)
 from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
+from certuma.observability import get_logger
 from certuma.reporting import queries as _rq
-from certuma.db.models import (Approval, Campaign, Event, KillSwitch, Lead, Message, Prospect,
-                               Suppression, Template, Thread)
+from certuma.db.models import (AccessLog, Approval, Campaign, ConsoleUser, Event, KillSwitch, Lead,
+                               Message, Prospect, Suppression, Template, Thread)
+
+_LOG = get_logger("certuma.api")
 from certuma.db.session import make_session_factory
 from certuma.email import get_provider
 from certuma.templates import TemplateNotFound, approve_template, lint_template
@@ -124,7 +128,7 @@ _AUTONOMY_LEVELS = ("assisted", "supervised", "autonomous")
 # nav: (label, path). Only implemented screens are listed so there are no dead links.
 _NAV = (("Approvals", "/"), ("Recommended", "/recommended"), ("Escalations", "/escalations"),
         ("Campaigns", "/campaigns"), ("Templates", "/studio"), ("Agents", "/agents"),
-        ("Analytics", "/analytics"), ("Activity", "/activity"))
+        ("Analytics", "/analytics"), ("Leadership", "/leadership"), ("Activity", "/activity"))
 
 # The agent workflow, for the Agent Studio diagram: (lane, [(name, kind, model, role)]).
 # kind 'llm' = a tunable Claude agent (teal); 'node' = a deterministic step (no prompt).
@@ -187,6 +191,10 @@ def _shell(db: Session, active_path: str, *, eyebrow: str, title: str, subtitle:
       <div><div class="brand-name">Certuma Reach</div><div class="brand-sub">Sales console</div></div>
     </div>
     <nav class="nav">{nav_html}</nav>
+    <form method="post" action="/logout" style="margin-top:auto;padding:14px 12px">
+      <button class="nav-item" type="submit" style="width:100%;border:0;cursor:pointer">
+        <span class="dot"></span><span>Sign out</span></button>
+    </form>
   </aside>
   <main class="content">
     <div id="kill-banner" class="banner{' live' if kill else ''}">
@@ -704,10 +712,108 @@ def _analytics_body(db: Session) -> str:
               or '<tr><td colspan=3 class="empty-cell">No touches yet.</td></tr>'}</tbody></table></div>"""
 
 
+def _render_login(error: str = "") -> str:
+    err = (f'<div class="banner live" style="display:block;margin-bottom:14px">{html.escape(error)}</div>'
+           if error else "")
+    return f"""<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in - Certuma Reach</title>
+<link rel="stylesheet" href="{_FONTS}"><link rel="stylesheet" href="/static/certuma.css"></head>
+<body><div style="max-width:360px;margin:13vh auto;padding:0 20px">
+  <div class="brand" style="padding:0 0 18px"><span class="brand-logo">CR</span>
+    <div><div class="brand-name">Certuma Reach</div><div class="brand-sub">Sales console</div></div></div>
+  <div class="card">{err}
+    <form method="post" action="/login">
+      <div class="field"><label>Username</label><input class="inp" name="username" autofocus></div>
+      <div class="field"><label>Password</label><input class="inp" type="password" name="password"></div>
+      <div class="actions"><button class="btn btn-primary" type="submit" style="width:100%">Sign in</button></div>
+    </form></div></div></body></html>"""
+
+
+def _leadership_body(db: Session) -> str:
+    f = _rq.funnel_totals(db)
+    eco = _rq.unit_economics(db)
+    cpa = "-" if eco["cost_per_activation"] is None else f"${eco['cost_per_activation']}"
+    kpis = [("Universe", f["universe"]), ("Activated", f["activated"]),
+            ("Activation rate", "-" if f["activation_rate"] is None else f"{f['activation_rate']}%"),
+            ("Cost / activation", cpa)]
+    kpi_html = "".join(f'<div class="kpi"><div class="v">{v}</div><div class="k">{k}</div></div>'
+                       for k, v in kpis)
+    return f"""
+    <div class="section-title"><h2>Program outcomes</h2><span class="t-meta">read-only</span></div>
+    <div class="kpis" style="grid-template-columns:repeat(4,1fr)">{kpi_html}</div>
+    {_dim_table("Conversion by specialty", _rq.by_dimension(db, "specialty"))}"""
+
+
 def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(title="Certuma Reach dashboard", version="0.2")
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    # session secret: from settings, else a per-process random one (dev). Sessions reset on restart.
+    secret = settings.session_secret
+    if not secret:
+        secret = os.urandom(32).hex()
+        _LOG.warning("CERTUMA_SESSION_SECRET is not set; using an ephemeral per-process secret. "
+                     "Sessions will not survive a restart and will be invalid across workers. "
+                     "Set CERTUMA_SESSION_SECRET in any multi-process or production deployment.")
+
+    def _user_of(request: Request) -> Optional[dict]:
+        token = request.cookies.get(auth.SESSION_COOKIE)
+        return auth.verify_session(token, secret=secret) if token else None
+
+    @app.middleware("http")
+    async def _auth_mw(request: Request, call_next):
+        path, method = request.url.path, request.method
+        public = (path == "/login" or path.startswith("/static/") or path.startswith("/track/open/"))
+        user = _user_of(request)
+        request.state.user = user
+        if public:
+            return await call_next(request)
+        if user is None:  # not signed in
+            if method == "GET":
+                return RedirectResponse("/login", status_code=303)
+            return JSONResponse({"detail": "authentication required"}, status_code=401)
+        # RBAC: leadership is read-only - only operator/admin may mutate (logout is always allowed)
+        if method != "GET" and path != "/logout" and not auth.can_write(user.get("role")):
+            return JSONResponse({"detail": "this role is read-only"}, status_code=403)
+        return await call_next(request)
+
+    @app.get("/login", response_class=HTMLResponse)
+    def login_form():
+        return _render_login()
+
+    @app.post("/login")
+    def login(username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+        user = auth.authenticate(db, username=username, password=password)
+        if user is None:
+            db.add(AccessLog(username=username, action="login_failed", path="/login"))
+            db.commit()
+            return HTMLResponse(_render_login("Invalid username or password."), status_code=401)
+        token = auth.sign_session(user.id, user.role, secret=secret)
+        db.add(AccessLog(username=user.username, role=user.role, action="login", path="/login"))
+        db.commit()
+        resp = RedirectResponse("/", status_code=303)
+        # NOTE: set secure=True behind HTTPS in production; httponly + samesite mitigate XSS/CSRF.
+        resp.set_cookie(auth.SESSION_COOKIE, token, httponly=True, samesite="lax",
+                        max_age=auth.SESSION_TTL)
+        return resp
+
+    @app.post("/logout")
+    def logout(request: Request, db: Session = Depends(get_db)):
+        session = getattr(request.state, "user", None) or {}
+        user = db.get(ConsoleUser, session["user_id"]) if session.get("user_id") else None
+        db.add(AccessLog(username=(user.username if user else None), role=session.get("role"),
+                         action="logout"))
+        db.commit()
+        resp = RedirectResponse("/login", status_code=303)
+        resp.delete_cookie(auth.SESSION_COOKIE)
+        return resp
+
+    @app.get("/leadership", response_class=HTMLResponse)
+    def leadership_page(db: Session = Depends(get_db)):
+        return _shell(db, "/leadership", eyebrow="Leadership", title="Leadership view",
+                      subtitle="High-level program outcomes (read-only).", body=_leadership_body(db))
 
     @app.get("/", response_class=HTMLResponse)
     def index(db: Session = Depends(get_db)):
@@ -761,9 +867,11 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
                       body=_activity_body(db))
 
     @app.get("/agents", response_class=HTMLResponse)
-    def agents_page(db: Session = Depends(get_db)):
-        agents.ensure_seeded(db)
-        db.commit()
+    def agents_page(request: Request, db: Session = Depends(get_db)):
+        # seed the defaults on first OPERATOR visit only; a read-only role never mutates on a GET
+        if auth.can_write((getattr(request.state, "user", None) or {}).get("role")):
+            agents.ensure_seeded(db)
+            db.commit()
         return _shell(db, "/agents", eyebrow="Configuration", title="Agent Studio",
                       subtitle="See how the agents hand off, tune each agent's prompt, and spin up new ones.",
                       body=_agents_body(db))

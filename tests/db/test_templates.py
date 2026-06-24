@@ -46,12 +46,15 @@ class TemplateTests(unittest.TestCase):
             cls.engine.dispose()
 
     def setUp(self):
+        from certuma import auth
         self.conn = self.engine.connect()
         self.trans = self.conn.begin()
         self.session = Session(bind=self.conn, join_transaction_mode="create_savepoint")
-        self.app = create_app()
+        self.app = create_app(settings=Settings(session_secret="test-secret-templates"))
         self.app.dependency_overrides[get_db] = self._override
         self.client = TestClient(self.app)
+        self.client.cookies.set(auth.SESSION_COOKIE,
+                                auth.sign_session(1, "operator", secret="test-secret-templates"))
 
     def tearDown(self):
         self.client.close()
