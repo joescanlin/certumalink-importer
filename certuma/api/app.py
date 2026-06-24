@@ -26,7 +26,8 @@ from sqlalchemy.orm import Session
 
 from certuma import gate, monitor, orchestrator
 from certuma.config import get_settings
-from certuma.db.models import Approval, Campaign, KillSwitch, Lead, Prospect, Suppression, Template
+from certuma.db.models import (Approval, Campaign, Event, KillSwitch, Lead, Message, Prospect,
+                               Suppression, Template)
 from certuma.db.session import make_session_factory
 from certuma.email import get_provider
 from certuma.templates import TemplateNotFound, approve_template, lint_template
@@ -92,7 +93,7 @@ class EmailEventBody(BaseModel):
 _TIER_CLASS = {"high": "tier-live", "medium": "tier-review", "low": "tier-new"}
 _AUTONOMY_LEVELS = ("assisted", "supervised", "autonomous")
 # nav: (label, path). Only implemented screens are listed so there are no dead links.
-_NAV = (("Approvals", "/"), ("Campaigns", "/campaigns"))
+_NAV = (("Approvals", "/"), ("Campaigns", "/campaigns"), ("Templates", "/studio"), ("Activity", "/activity"))
 
 
 def _initials(name: str) -> str:
@@ -173,6 +174,16 @@ function campaignSet(name, field, value) {{
   const payload = {{}}; payload[field] = value;
   _post('/campaigns/' + encodeURIComponent(name), payload);
 }}
+async function lintTemplate(id) {{
+  const el = document.getElementById('lint-' + id);
+  el.className = 'lint-result'; el.textContent = 'Linting...';
+  try {{
+    const d = await (await fetch('/templates/' + id + '/lint')).json();
+    el.className = 'lint-result ' + (d.ok ? 'ok' : 'bad');
+    el.textContent = d.ok ? 'Lint passed - compliant' : ('Issues: ' + d.problems.join('; '));
+  }} catch (e) {{ el.textContent = 'Lint failed to run'; }}
+}}
+function approveTemplate(id) {{ _post('/templates/' + id + '/approve', {{approved_by: 'console'}}); }}
 </script>
 </body></html>"""
 
@@ -275,6 +286,103 @@ def _campaigns_body(db: Session) -> str:
       (supervised / autonomous are Phase 2).</div>"""
 
 
+def _studio_body(db: Session) -> str:
+    templates = db.execute(select(Template).order_by(Template.campaign, Template.version)).scalars().all()
+    cards = []
+    for t in templates:
+        scope = html.escape(t.campaign) if t.campaign else "all campaigns"
+        variant = f" - {html.escape(t.variant_label)}" if t.variant_label else ""
+        status = ('<span class="pill pill-on">approved</span>' if t.is_approved
+                  else '<span class="pill pill-warn">draft</span>')
+        approver = f' by {html.escape(t.approved_by)}' if (t.is_approved and t.approved_by) else ""
+        approve_btn = (
+            f'<button class="btn btn-sm btn-primary" onclick="approveTemplate({t.id})">Approve</button>'
+            if not t.is_approved else "")
+        cards.append(f"""
+        <div class="card">
+          <div class="card-head">
+            <div class="who">
+              <div class="name">{html.escape(t.subject)}</div>
+              <div class="sub">{scope}{variant} - v{t.version}{approver}</div>
+            </div>
+            {status}
+          </div>
+          <div class="proposed"><div class="body">{html.escape(t.body)}</div></div>
+          <div class="actions">
+            <button class="btn btn-sm btn-secondary" onclick="lintTemplate({t.id})">Run linter</button>
+            {approve_btn}
+            <span id="lint-{t.id}" class="lint-result"></span>
+          </div>
+        </div>""")
+    body = "".join(cards) if cards else '<div class="empty">No templates yet.</div>'
+    return f"""
+    <div class="section-title"><h2>Templates</h2><span class="t-meta">{len(templates)} total</span></div>
+    {body}"""
+
+
+def _activity_body(db: Session) -> str:
+    sent = db.execute(
+        select(func.count()).select_from(Message).where(Message.direction == "outbound")
+    ).scalar()
+    delivered = db.execute(
+        select(func.count()).select_from(Message).where(
+            Message.direction == "outbound", Message.delivered.is_(True))
+    ).scalar()
+    activated = db.execute(
+        select(func.count()).select_from(Lead).where(Lead.activation_status == "physician_activated")
+    ).scalar()
+
+    status_counts = dict(
+        db.execute(select(Lead.activation_status, func.count()).group_by(Lead.activation_status)).all()
+    )
+    status_rows = "".join(
+        f'<tr><td>{html.escape(s)}</td><td class="tabular">{n}</td></tr>'
+        for s, n in sorted(status_counts.items(), key=lambda kv: -kv[1])
+    ) or '<tr><td colspan="2" class="empty-cell">No leads yet.</td></tr>'
+
+    supps = db.execute(
+        select(Suppression).order_by(Suppression.created_at.desc()).limit(10)
+    ).scalars().all()
+    supp_rows = "".join(
+        f'<tr><td><span class="pill pill-warn">{html.escape(s.reason)}</span></td>'
+        f'<td class="t-meta">{html.escape(s.email or s.npi or "")}</td></tr>'
+        for s in supps
+    ) or '<tr><td colspan="2" class="empty-cell">No suppressions.</td></tr>'
+
+    events = db.execute(select(Event).order_by(Event.occurred_at.desc()).limit(12)).scalars().all()
+    event_rows = "".join(
+        f'<tr><td>{html.escape(e.event_type)}</td>'
+        f'<td class="t-meta">{html.escape(e.npi or "")}</td></tr>'
+        for e in events
+    ) or '<tr><td colspan="2" class="empty-cell">No events yet.</td></tr>'
+
+    def pct(n):
+        return f"{round(100 * n / sent)}%" if sent else "-"
+
+    return f"""
+    <div class="section-title"><h2>Conversion funnel</h2></div>
+    <div class="kpis">
+      <div class="kpi"><div class="v">{sent}</div><div class="k">Emails sent</div></div>
+      <div class="kpi"><div class="v">{delivered}</div><div class="k">Delivered ({pct(delivered)})</div></div>
+      <div class="kpi"><div class="v">{activated}</div><div class="k">Activated ({pct(activated)})</div></div>
+    </div>
+    <div class="grid-2">
+      <div class="card pad0">
+        <table class="tbl"><thead><tr><th>Lead status</th><th>Count</th></tr></thead>
+          <tbody>{status_rows}</tbody></table>
+      </div>
+      <div class="card pad0">
+        <table class="tbl"><thead><tr><th>Recent suppressions</th><th></th></tr></thead>
+          <tbody>{supp_rows}</tbody></table>
+      </div>
+    </div>
+    <div class="section-title" style="margin-top:22px"><h2>Recent events</h2></div>
+    <div class="card pad0">
+      <table class="tbl"><thead><tr><th>Event</th><th>NPI</th></tr></thead>
+        <tbody>{event_rows}</tbody></table>
+    </div>"""
+
+
 def create_app(settings=None, email_provider=None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(title="Certuma Reach dashboard", version="0.2")
@@ -292,6 +400,18 @@ def create_app(settings=None, email_provider=None) -> FastAPI:
         return _shell(db, "/campaigns", eyebrow="Configuration", title="Campaigns",
                       subtitle="Activate, pause, and set the autonomy level for each outreach campaign.",
                       body=_campaigns_body(db))
+
+    @app.get("/studio", response_class=HTMLResponse)
+    def studio_page(db: Session = Depends(get_db)):
+        return _shell(db, "/studio", eyebrow="Copy", title="Template studio",
+                      subtitle="Lint and approve the email templates the copywriter drafts from.",
+                      body=_studio_body(db))
+
+    @app.get("/activity", response_class=HTMLResponse)
+    def activity_page(db: Session = Depends(get_db)):
+        return _shell(db, "/activity", eyebrow="Pipeline", title="Activity",
+                      subtitle="The send-to-activation funnel, suppressions, and recent lifecycle events.",
+                      body=_activity_body(db))
 
     @app.get("/health")
     def health(db: Session = Depends(get_db)):
