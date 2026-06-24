@@ -27,6 +27,8 @@ class Settings:
 
     # --- cold-ESP / sending store (firewalled from corporate) ---
     esp_api_key: str = ""             # cold-outreach provider key (separate account)
+    esp_base_url: str = ""            # cold-tolerant ESP API base (CERTUMA_ESP_BASE_URL)
+    webhook_secret: str = ""          # shared secret for provider event/inbound webhooks
     email_provider: str = "mailpit"   # 'mailpit' (dev) | 'esp' (cold-tolerant provider, later)
     smtp_host: str = "127.0.0.1"      # Mailpit dev SMTP (certumalocal)
     smtp_port: int = 11025
@@ -60,6 +62,8 @@ class Settings:
             publish_base_url=e.get("CERTUMALINK_API_URL", ""),
             publish_token=e.get("CERTUMALINK_API_TOKEN", ""),
             esp_api_key=e.get("CERTUMA_ESP_API_KEY", ""),
+            esp_base_url=e.get("CERTUMA_ESP_BASE_URL", ""),
+            webhook_secret=e.get("CERTUMA_WEBHOOK_SECRET", ""),
             email_provider=e.get("CERTUMA_EMAIL_PROVIDER", "mailpit"),
             smtp_host=e.get("CERTUMA_SMTP_HOST", "127.0.0.1"),
             smtp_port=_int("CERTUMA_SMTP_PORT", 11025),

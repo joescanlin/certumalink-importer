@@ -12,6 +12,7 @@ design tokens) so the console reads as the same product as the doctor profiles.
 
 No `from __future__ import annotations` here so pydantic v2 sees real type objects on Python 3.9.
 """
+import hmac
 import html
 import os
 from datetime import datetime, timezone
@@ -38,6 +39,9 @@ _LOG = get_logger("certuma.api")
 from certuma.db.session import make_session_factory
 from certuma.email import get_provider
 from certuma.templates import TemplateNotFound, approve_template, lint_template
+
+# machine endpoints a provider may post to with the webhook secret (instead of a user session)
+_WEBHOOK_PATHS = ("/events/email", "/inbound/reply", "/inbound/esp")
 
 # a 1x1 transparent GIF returned by the open-tracking pixel endpoint
 _PIXEL_GIF = (b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00"
@@ -770,6 +774,12 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
         request.state.user = user
         if public:
             return await call_next(request)
+        # machine webhook auth (P3.10): a provider posting events/replies presents the shared secret
+        # instead of a session. Off by default (no secret configured) so nothing is silently open.
+        if (path in _WEBHOOK_PATHS and settings.webhook_secret and hmac.compare_digest(
+                request.headers.get("x-certuma-webhook-secret", ""), settings.webhook_secret)):
+            request.state.user = {"role": "operator", "user_id": 0}  # machine has write capability
+            return await call_next(request)
         if user is None:  # not signed in
             if method == "GET":
                 return RedirectResponse("/login", status_code=303)
@@ -1005,6 +1015,19 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
             db.commit()
         return Response(content=_PIXEL_GIF, media_type="image/gif",
                         headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+
+    @app.post("/inbound/esp")
+    def inbound_esp(payload: dict, db: Session = Depends(get_db)):
+        # the real ESP/IMAP inbound webhook seam: normalize the provider payload, then handle it
+        fields = inbound.parse_esp_inbound(payload)
+        if fields is None:
+            return {"matched": False, "reason": "no reply token in payload"}
+        res, outcome = inbound.handle_reply(
+            db, occurred_at=datetime.now(timezone.utc),
+            classifier=classifier or StubReplyClassifier(), **fields)
+        db.commit()
+        return {"matched": res.matched, "duplicate": res.duplicate,
+                "intent": outcome.intent if outcome else None}
 
     @app.post("/inbound/reply")
     def inbound_reply(body: ReplyBody, db: Session = Depends(get_db)):
