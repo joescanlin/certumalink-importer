@@ -189,6 +189,18 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(lead.activation_status, "physician_activated")
         self.assertIsNotNone(lead.activation_detected_at)
 
+    # ---- open tracking (P3.5) ----
+    def test_opened_event_updates_rollup_without_transition(self):
+        lead, msg = self._seed_sent("1700001020", status="awaiting_reply")
+        r = monitor.ingest_event(self.session, event_type="opened", dedup_key="open-1",
+                                 occurred_at=OCCURRED, message_id=msg.id, when=OCCURRED)
+        self.assertIsNone(r.transitioned_to)  # an open never moves the lead
+        self.session.refresh(lead)
+        self.assertEqual(lead.open_count, 1)
+        self.assertEqual(lead.last_open_at, OCCURRED)
+        self.assertEqual(lead.last_engaged_at, OCCURRED)
+        self.assertEqual(lead.activation_status, "awaiting_reply")
+
     # ---- breaker ----
     def test_bounce_breaker_trips_gate(self):
         # below threshold sample count -> not tripped

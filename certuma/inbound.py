@@ -81,6 +81,7 @@ def ingest_reply(
         METRICS.incr("inbound_duplicate")
         return InboundResult(matched=True, duplicate=True, lead_id=lead.id)
 
+    lead.last_engaged_at = when  # a reply is the strongest engagement signal (P3.5 rollup)
     moved = monitor.try_transition(session, lead, "replied", actor="inbound", reason_code="reply_received")
     monitor.record_event(session, event_type="replied", dedup_key=f"reply:{esp_message_id}",
                          occurred_at=occurred_at, lead_id=lead.id, message_id=msg.id, npi=lead.npi,

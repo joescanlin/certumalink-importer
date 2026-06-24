@@ -194,6 +194,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(email_provider.outbound.to_addr, f"dr.{lead.npi}@example.com")
         self.assertEqual(email_provider.outbound.subject, appr.proposed_subject)
         self.assertIn(CLAIM, email_provider.outbound.html_body)
+        self.assertIn("track/open", email_provider.outbound.html_body)  # open pixel embedded (P3.5)
         # an outbound message was recorded (the idempotency key)
         msg = self.session.execute(
             select(Message).where(Message.lead_id == lead.id, Message.direction == "outbound")

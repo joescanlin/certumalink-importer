@@ -263,6 +263,14 @@ def ingest_event(
                               transitioned_to="physician_activated" if activated else None,
                               activated=activated)
 
-    # opened / sent / replied: recorded only in Phase 1 (no transition).
+    elif event_type == "opened":
+        # an open is a WEAK engagement signal: update the rollup, never transition the lead (P3.5).
+        if lead is not None:
+            lead.open_count = (lead.open_count or 0) + 1
+            lead.last_open_at = when
+            lead.last_engaged_at = when
+            METRICS.incr("email_opened")
+
+    # sent / replied: recorded only (no transition here; replies are handled in certuma.inbound).
     session.flush()
     return result

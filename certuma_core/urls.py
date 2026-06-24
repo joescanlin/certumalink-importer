@@ -13,7 +13,7 @@ from .util import clean
 
 __all__ = [
     "DEFAULT_BASE_URL", "slugify", "profile_slug", "profile_url", "claim_urls_by_npi",
-    "unsubscribe_url", "unsubscribe_mailto",
+    "unsubscribe_url", "unsubscribe_mailto", "open_pixel_url",
 ]
 
 DEFAULT_BASE_URL = "https://www.certumalink.com"
@@ -31,6 +31,12 @@ def unsubscribe_url(domain: str, npi: str) -> str:
 def unsubscribe_mailto(domain: str) -> str:
     """The mailto: half of the List-Unsubscribe pair."""
     return f"mailto:unsubscribe@{domain}"
+
+
+def open_pixel_url(domain: str, token: str) -> str:
+    """The open-tracking pixel URL embedded in an outbound email (P3.5). `token` is the thread
+    reply_token, so a fetch maps back to the lead. Opens are a WEAK signal (mail proxies inflate them)."""
+    return f"https://{domain}/track/open/{token}"
 
 
 def slugify(value: str) -> str:
