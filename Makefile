@@ -6,12 +6,16 @@ PY := $(VENV)/bin/python
 ALEMBIC := $(VENV)/bin/alembic
 export CERTUMA_DATABASE_URL ?= postgresql+psycopg://certuma:certuma@localhost:55433/certuma
 
-.PHONY: venv db-up db-wait db-down db-reset migrate downgrade db-shell test test-core test-db all-tests demo tick rebuild evidence clean
+.PHONY: venv db-up db-wait db-down db-reset migrate downgrade db-shell test test-core test-db all-tests demo tick rebuild evidence create-user clean
 
 venv:                ## create the app venv and install deps
 	python3 -m venv $(VENV)
 	$(PY) -m pip install --quiet --upgrade pip
 	$(PY) -m pip install --quiet "SQLAlchemy>=2.0,<2.1" "alembic>=1.13" "psycopg[binary]>=3.1"
+	$(PY) -m pip install --quiet "fastapi>=0.110" "uvicorn>=0.27" "python-multipart>=0.0.9"
+
+create-user:         ## create a dashboard login: make create-user U=alice P=secret R=operator
+	PYTHONPATH=.:src $(PY) -c "from certuma.db.session import make_engine; from sqlalchemy.orm import Session; from certuma import auth; s=Session(make_engine()); auth.create_user(s, username='$(U)', password='$(P)', role='$(R)'); s.commit(); print('created user', '$(U)', 'role', '$(R)')"
 
 db-up:               ## start the local Postgres container
 	docker compose up -d

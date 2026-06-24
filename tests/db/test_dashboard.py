@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 
 try:
     from fastapi.testclient import TestClient
-    from sqlalchemy import create_engine, inspect, text
+    from sqlalchemy import create_engine, func, inspect, select, text
     from sqlalchemy.orm import Session
     HAVE_DEPS = True
 except Exception:  # pragma: no cover
@@ -29,17 +29,24 @@ if HAVE_DEPS:
     from certuma import reply_drafter
     from certuma.config import Settings
     from certuma.api.app import create_app, get_db
-    from certuma.db.models import (Approval, Campaign, Contact, Event, Lead, Mailbox, Message,
-                                   Prospect, Suppression, Thread)
+    from certuma.db.models import (AccessLog, Approval, Campaign, Contact, Event, Lead, Mailbox,
+                                   Message, Prospect, Suppression, Thread)
     from certuma.email.provider import SendResult
+    from certuma import auth
 
 DB_URL = os.environ.get("CERTUMA_DATABASE_URL") or (Settings().database_url if HAVE_DEPS else "")
 CLAIM = "https://www.certumalink.com/claim/abc"
+TEST_SECRET = "test-secret-0123456789abcdef"
 SETTINGS = Settings(
     sender_from_email="jordan@getcertuma.com", sender_from_name="Jordan Avery",
     sender_from_title="Provider Onboarding", postal_address="Certuma, 1 Main St, Austin TX 78701",
-    cold_domain="getcertuma.com", reply_to_domain="getcertuma.com",
+    cold_domain="getcertuma.com", reply_to_domain="getcertuma.com", session_secret=TEST_SECRET,
 ) if HAVE_DEPS else None
+
+
+def _auth(client, role="operator"):
+    """Set a valid pre-signed session cookie so the client is authenticated as `role`."""
+    client.cookies.set(auth.SESSION_COOKIE, auth.sign_session(1, role, secret=TEST_SECRET))
 
 
 class CaptureEmailProvider:
@@ -78,9 +85,10 @@ class DashboardTests(unittest.TestCase):
         self.conn = self.engine.connect()
         self.trans = self.conn.begin()
         self.session = Session(bind=self.conn, join_transaction_mode="create_savepoint")
-        self.app = create_app()
+        self.app = create_app(settings=Settings(session_secret=TEST_SECRET))
         self.app.dependency_overrides[get_db] = self._override
         self.client = TestClient(self.app)
+        _auth(self.client)  # authenticated as operator for all dashboard requests (P3.9)
 
     def tearDown(self):
         self.client.close()
@@ -199,6 +207,7 @@ class DashboardTests(unittest.TestCase):
         app = create_app(settings=SETTINGS, email_provider=capture)
         app.dependency_overrides[get_db] = self._override
         client = TestClient(app)
+        _auth(client)
         try:
             send = client.post(f"/approvals/{appr.id}/decision", json={"decision": "approved"}).json()["send"]
         finally:
@@ -276,6 +285,60 @@ class DashboardTests(unittest.TestCase):
         for marker in ("Conversion funnel", "Emails sent", "Recent events", "Lead status",
                        "physician_activated", "opt_out", "delivered"):
             self.assertIn(marker, r.text)
+
+    # ---- auth + RBAC (Phase 3 P3.9) ----
+    def test_auth_is_required(self):
+        c = TestClient(self.app)  # no session cookie
+        self.assertEqual(c.get("/", follow_redirects=False).status_code, 303)        # -> /login
+        self.assertEqual(c.post("/kill-switch", json={"active": True}).status_code, 401)
+
+    def test_public_paths_need_no_auth(self):
+        c = TestClient(self.app)  # unauthenticated
+        self.assertEqual(c.get("/login").status_code, 200)
+        self.assertEqual(c.get("/static/certuma.css").status_code, 200)
+        self.assertEqual(c.get("/track/open/anything").status_code, 200)  # the pixel must be public
+
+    def test_login_flow_with_password(self):
+        auth.create_user(self.session, username="alice", password="s3cret!", role="operator")
+        self.session.flush()
+        c = TestClient(self.app)  # unauthenticated
+        bad = c.post("/login", data={"username": "alice", "password": "wrong"}, follow_redirects=False)
+        self.assertEqual(bad.status_code, 401)
+        ok = c.post("/login", data={"username": "alice", "password": "s3cret!"}, follow_redirects=False)
+        self.assertEqual(ok.status_code, 303)
+        self.assertIn(auth.SESSION_COOKIE, ok.cookies)
+        actions = {r[0] for r in self.session.execute(select(AccessLog.action)).all()}
+        self.assertIn("login", actions)
+        self.assertIn("login_failed", actions)
+
+    def test_leadership_role_is_read_only(self):
+        c = TestClient(self.app)
+        _auth(c, role="leadership")
+        self.assertEqual(c.get("/analytics").status_code, 200)        # may read analytics
+        self.assertEqual(c.get("/leadership").status_code, 200)       # may read the leadership view
+        self.assertEqual(c.post("/kill-switch", json={"active": True}).status_code, 403)  # may not mutate
+
+    def test_leadership_view_renders(self):
+        r = self.client.get("/leadership")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Leadership view", "Program outcomes", "Activation rate"):
+            self.assertIn(marker, r.text)
+
+    def test_leadership_get_agents_does_not_seed(self):
+        # a read-only role must not mutate the DB via a GET (the GET /agents seed is operator-only)
+        from certuma.db.models import Agent
+        before = self.session.execute(select(func.count()).select_from(Agent)).scalar()
+        c = TestClient(self.app)
+        _auth(c, role="leadership")
+        self.assertEqual(c.get("/agents").status_code, 200)
+        after = self.session.execute(select(func.count()).select_from(Agent)).scalar()
+        self.assertEqual(before, after)
+
+    def test_logout_clears_session_and_logs(self):
+        r = self.client.post("/logout", follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        actions = {a[0] for a in self.session.execute(select(AccessLog.action)).all()}
+        self.assertIn("logout", actions)
 
     # ---- Recommended actions (Phase 3) ----
     def test_recommended_page_ranks_open_leads(self):

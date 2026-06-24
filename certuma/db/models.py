@@ -369,8 +369,33 @@ class ClinicianSignal(Base):
     created_at = Column(_TS, server_default=func.now())
 
 
+class ConsoleUser(Base):
+    """A dashboard login (Phase 3 P3.9). Salted PBKDF2 password hash; role gates RBAC."""
+    __tablename__ = "console_user"
+    __table_args__ = (CheckConstraint("role IN ('operator','leadership','admin')", name="console_role_valid"),)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    username = Column(CITEXT, unique=True, nullable=False)
+    password_hash = Column(Text, nullable=False)
+    salt = Column(Text, nullable=False)
+    role = Column(Text, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(_TS, server_default=func.now())
+
+
+class AccessLog(Base):
+    """Auth events + mutations for the SOC 2 access-logging posture (Phase 3 P3.9)."""
+    __tablename__ = "access_log"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    username = Column(Text)
+    role = Column(Text)
+    action = Column(Text, nullable=False)
+    path = Column(Text)
+    at = Column(_TS, server_default=func.now())
+
+
 ALL_TABLES = [
     "practice_group", "app_user", "campaign", "prospect", "contact", "workflow_score",
     "lead", "thread", "message", "event", "suppression", "template", "approval",
     "audit_log", "kill_switch", "mailbox", "circuit_breaker_state", "agent", "clinician_signal",
+    "console_user", "access_log",
 ]
