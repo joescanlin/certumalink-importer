@@ -6,7 +6,7 @@ PY := $(VENV)/bin/python
 ALEMBIC := $(VENV)/bin/alembic
 export CERTUMA_DATABASE_URL ?= postgresql+psycopg://certuma:certuma@localhost:55433/certuma
 
-.PHONY: venv db-up db-wait db-down db-reset migrate downgrade db-shell test test-core test-db all-tests clean
+.PHONY: venv db-up db-wait db-down db-reset migrate downgrade db-shell test test-core test-db all-tests demo clean
 
 venv:                ## create the app venv and install deps
 	python3 -m venv $(VENV)
@@ -49,6 +49,9 @@ test-db:             ## schema/migration tests (needs db-up + migrate)
 	PYTHONPATH=.:src $(PY) -m unittest discover -s tests/db -p "test_*.py"
 
 all-tests: db-up migrate test test-db  ## everything, against a live DB
+
+demo:                ## run the end-to-end Assisted-loop demo (needs db-up migrate + Mailpit)
+	PYTHONPATH=.:src $(PY) -m certuma.demo
 
 clean:
 	find . -name __pycache__ -type d -prune -exec rm -rf {} +
