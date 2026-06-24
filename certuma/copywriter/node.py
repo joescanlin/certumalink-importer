@@ -8,13 +8,14 @@ practice_group_size >= 3); IDs verified against the Claude API reference.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from dataclasses import dataclass, field, replace
+from typing import List, Optional, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from certuma_core import campaigns, linter, urls
+from certuma_core.learning import assign_variant
 from certuma_core.copy_schema import SeedFacts, allowlist_sources
 from certuma.config import Settings, get_settings
 from certuma.db.models import Lead, Prospect, Template, WorkflowScore
@@ -59,6 +60,21 @@ def _approved_template(session: Session, campaign: Optional[str]) -> Optional[Te
     return tpl
 
 
+def _approved_variants(session: Session, campaign: Optional[str]) -> List[Template]:
+    """All approved templates for the campaign (its A/B variants); falls back to the campaign-agnostic
+    approved template when the campaign has none of its own."""
+    rows = session.execute(
+        select(Template).where(Template.campaign == campaign, Template.is_approved.is_(True))
+        .order_by(Template.version, Template.id)
+    ).scalars().all()
+    if rows:
+        return list(rows)
+    return list(session.execute(
+        select(Template).where(Template.campaign.is_(None), Template.is_approved.is_(True))
+        .order_by(Template.version, Template.id)
+    ).scalars().all())
+
+
 def draft_email(
     session: Session,
     lead: Lead,
@@ -69,10 +85,18 @@ def draft_email(
 ) -> CopyResult:
     settings = settings or get_settings()
 
-    template = _approved_template(session, lead.campaign)
-    if template is None:
+    # A/B (P3.7): if a campaign has multiple approved variants, assign one STABLY per clinician
+    # (npi), so a lead never switches variant and its outcome attributes to a single variant.
+    variants = _approved_variants(session, lead.campaign)
+    if not variants:
         METRICS.incr("copy_no_template")
         return CopyResult(ok=False, reason="no_approved_template")
+    if len(variants) > 1:
+        template = assign_variant(variants, key=lead.npi)
+        variant_label = template.variant_label or f"v{template.version}"
+    else:
+        template = variants[0]
+        variant_label = None  # single template: keep the provider's variant id (unchanged behavior)
 
     prospect = session.get(Prospect, lead.npi)
     preset = campaigns.CAMPAIGN_PRESETS.get(lead.campaign)
@@ -109,6 +133,8 @@ def draft_email(
         copy = provider.draft(
             template_subject=template.subject, template_body=template.body, facts=facts, model=model
         )
+        if variant_label:
+            copy = replace(copy, variant_id=variant_label)  # tag the touch with its A/B variant
         rendered = render(copy, claim_url=claim_url, unsubscribe_url=unsubscribe_url,
                           unsubscribe_mailto=unsubscribe_mailto, postal_address=postal)
         result = linter.lint(

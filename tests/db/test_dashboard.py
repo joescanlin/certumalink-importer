@@ -251,7 +251,8 @@ class DashboardTests(unittest.TestCase):
     def test_studio_page_renders(self):
         r = self.client.get("/studio")
         self.assertEqual(r.status_code, 200)
-        for marker in ("Template studio", "Run linter", "lintTemplate(", "approveTemplate("):
+        for marker in ("Template studio", "Run linter", "lintTemplate(", "approveTemplate(",
+                       "Variant performance"):
             self.assertIn(marker, r.text)
         self.assertIn("draft", r.text)  # the seeded placeholder template awaits approval
 
