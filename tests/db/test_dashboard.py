@@ -28,9 +28,27 @@ except Exception:  # pragma: no cover
 if HAVE_DEPS:
     from certuma.config import Settings
     from certuma.api.app import create_app, get_db
-    from certuma.db.models import Approval, Campaign, Lead, Prospect
+    from certuma.db.models import Approval, Campaign, Contact, Lead, Mailbox, Message, Prospect
+    from certuma.email.provider import SendResult
 
 DB_URL = os.environ.get("CERTUMA_DATABASE_URL") or (Settings().database_url if HAVE_DEPS else "")
+CLAIM = "https://www.certumalink.com/claim/abc"
+SETTINGS = Settings(
+    sender_from_email="jordan@getcertuma.com", sender_from_name="Jordan Avery",
+    sender_from_title="Provider Onboarding", postal_address="Certuma, 1 Main St, Austin TX 78701",
+    cold_domain="getcertuma.com", reply_to_domain="getcertuma.com",
+) if HAVE_DEPS else None
+
+
+class CaptureEmailProvider:
+    name = "capture"
+
+    def __init__(self):
+        self.outbound = None
+
+    def send(self, email):
+        self.outbound = email
+        return SendResult(provider_message_id="esp-dash-1", accepted=True)
 
 
 @unittest.skipUnless(HAVE_DEPS, "SQLAlchemy/FastAPI not installed")
@@ -129,6 +147,98 @@ class DashboardTests(unittest.TestCase):
         g = self.client.get("/gate/preview", params={"npi": "1000000001", "campaign": "dermatology"}).json()
         self.assertEqual((g["decision"], g["reason_code"]), ("HOLD", "campaign_paused"))
         self.assertEqual(self.client.post("/campaigns/nope/pause", json={"paused": True}).status_code, 404)
+
+    # ---- styled console ----
+    def test_index_renders_styled_console(self):
+        self._seed_approval()
+        r = self.client.get("/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/html", r.headers["content-type"])
+        for marker in ("Certuma Reach", "Approvals", "/static/certuma.css", "Plus+Jakarta+Sans",
+                       "Dr Test", "Approve"):
+            self.assertIn(marker, r.text)
+
+    def test_stylesheet_is_served(self):
+        r = self.client.get("/static/certuma.css")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/css", r.headers["content-type"])
+        self.assertIn("--accent: #2d5b6e", r.text)  # the certumalink teal token
+
+    # ---- Approve wires the orchestrator ----
+    def test_approve_without_contact_reports_orchestrator_error(self):
+        # the seeded approval has no contact/mailbox: execute_approved_send must run and surface it
+        aid = self._seed_approval("1000000002")
+        send = self.client.post(f"/approvals/{aid}/decision", json={"decision": "approved"}).json()["send"]
+        self.assertEqual(send, {"sent": False, "error": "NoValidContact"})
+
+    def test_approve_full_seed_runs_full_send_path(self):
+        npi = "1000000003"
+        self.session.add(Prospect(npi=npi, display_name="Dr Send", first_name="Sam", last_name="Send",
+                                  primary_specialty="Dermatology", practice_city="Austin", practice_state="TX"))
+        self.session.flush()
+        # the Gate's CAN-SPAM check needs an approved template configured for the campaign
+        from sqlalchemy import update as _update
+        from certuma.db.models import Template
+        self.session.execute(_update(Template).where(Template.campaign.is_(None), Template.version == 1)
+                             .values(is_approved=True))
+        self.session.add(Contact(npi=npi, email=f"dr.{npi}@example.com", email_status="valid"))
+        self.session.add(Mailbox(address="jordan@getcertuma.com", domain="getcertuma.com", is_active=True))
+        lead = Lead(npi=npi, campaign="dermatology", activation_status="sendable", claim_url=CLAIM)
+        self.session.add(lead)
+        self.session.flush()
+        body = (f"Hi Dr Send, review your dermatology profile: {CLAIM}. "
+                f"Unsubscribe: https://getcertuma.com/u/{npi}. {SETTINGS.postal_address}")
+        appr = Approval(lead_id=lead.id, proposed_action="send_email", value_tier="high",
+                        proposed_subject="Your dermatology profile", proposed_body=body, state="pending")
+        self.session.add(appr)
+        self.session.flush()
+
+        capture = CaptureEmailProvider()
+        app = create_app(settings=SETTINGS, email_provider=capture)
+        app.dependency_overrides[get_db] = self._override
+        client = TestClient(app)
+        try:
+            send = client.post(f"/approvals/{appr.id}/decision", json={"decision": "approved"}).json()["send"]
+        finally:
+            client.close()
+        self.assertIsNotNone(send)
+        self.assertIn("sent", send)
+        if send["sent"]:
+            self.assertIsNotNone(capture.outbound)
+            self.assertEqual(capture.outbound.to_addr, f"dr.{npi}@example.com")
+            self.session.refresh(lead)
+            self.assertEqual(lead.activation_status, "email_sent")
+        else:
+            # the only non-suppressed HOLD possible for this clean lead is quiet hours (wall clock)
+            self.assertEqual(send["reason_code"], "quiet_hours")
+
+    # ---- inbound event webhook ----
+    def test_event_webhook_drives_lifecycle(self):
+        npi = "1000000004"
+        self.session.add(Prospect(npi=npi, display_name="Dr Event"))
+        self.session.flush()
+        lead = Lead(npi=npi, campaign="dermatology", activation_status="email_sent")
+        self.session.add(lead)
+        self.session.flush()
+        msg = Message(lead_id=lead.id, npi=npi, campaign="dermatology", cadence_step=1,
+                      direction="outbound", subject="s")
+        self.session.add(msg)
+        self.session.flush()
+
+        r = self.client.post("/events/email", json={
+            "event_type": "delivered", "dedup_key": "wh-d-1", "message_id": msg.id,
+            "occurred_at": "2026-06-23T15:00:00+00:00"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["transitioned_to"], "awaiting_reply")
+        # redelivery is deduped
+        r2 = self.client.post("/events/email", json={
+            "event_type": "delivered", "dedup_key": "wh-d-1", "message_id": msg.id})
+        self.assertTrue(r2.json()["duplicate"])
+        # an opt-out suppresses + stops the lead
+        r3 = self.client.post("/events/email", json={
+            "event_type": "opt_out", "dedup_key": "wh-o-1", "npi": npi})
+        self.assertEqual(r3.json()["transitioned_to"], "do_not_contact")
+        self.assertTrue(r3.json()["suppressed"])
 
 
 if __name__ == "__main__":
