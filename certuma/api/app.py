@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from certuma import gate, inbound, monitor, orchestrator
+from certuma import agents, gate, inbound, monitor, orchestrator
 from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
 from certuma.db.models import (Approval, Campaign, Event, KillSwitch, Lead, Message, Prospect,
@@ -99,10 +99,46 @@ class ReplyBody(BaseModel):
     occurred_at: Optional[str] = None
 
 
+class AgentCreateBody(BaseModel):
+    role: str
+    name: str
+    model: str = ""
+    system_prompt: str
+    activate: bool = False
+
+
+class AgentUpdateBody(BaseModel):
+    name: Optional[str] = None
+    model: Optional[str] = None
+    system_prompt: Optional[str] = None
+
+
 _TIER_CLASS = {"high": "tier-live", "medium": "tier-review", "low": "tier-new"}
 _AUTONOMY_LEVELS = ("assisted", "supervised", "autonomous")
 # nav: (label, path). Only implemented screens are listed so there are no dead links.
-_NAV = (("Approvals", "/"), ("Campaigns", "/campaigns"), ("Templates", "/studio"), ("Activity", "/activity"))
+_NAV = (("Approvals", "/"), ("Campaigns", "/campaigns"), ("Templates", "/studio"),
+        ("Agents", "/agents"), ("Activity", "/activity"))
+
+# The agent workflow, for the Agent Studio diagram: (lane, [(name, kind, model, role)]).
+# kind 'llm' = a tunable Claude agent (teal); 'node' = a deterministic step (no prompt).
+_PIPELINE = (
+    ("Outbound", (
+        ("Enricher", "node", "", "Find and verify a deliverable email; only valid contacts pass."),
+        ("Copywriter", "llm", "Sonnet / Opus", "Draft the email from an approved template."),
+        ("Compliance Gate", "node", "", "Suppression, CAN-SPAM, quiet hours, warmup caps, breakers."),
+        ("Sender", "node", "", "At-most-once send with the List-Unsubscribe header."),
+    )),
+    ("Inbound", (
+        ("Monitor", "node", "", "Delivered / bounce / complaint / opt-out drive the lifecycle."),
+        ("Reply Classifier", "llm", "Haiku", "Label inbound reply intent."),
+        ("Reply Drafter", "llm", "Opus", "Draft objection and question responses (human-approved)."),
+        ("Claim Poller", "node", "", "Detect the claim-click and convert to physician_activated."),
+    )),
+    ("Control", (
+        ("Orchestrator + Policy", "node", "", "Propose sends, apply autonomy, escalate exceptions."),
+        ("Ledger-writer", "node", "", "The single writer of lead status; every move guarded and audited."),
+    )),
+)
 
 
 def _initials(name: str) -> str:
@@ -193,6 +229,18 @@ async function lintTemplate(id) {{
   }} catch (e) {{ el.textContent = 'Lint failed to run'; }}
 }}
 function approveTemplate(id) {{ _post('/templates/' + id + '/approve', {{approved_by: 'console'}}); }}
+function _val(scope, cls) {{ const el = scope.querySelector('.' + cls); return el ? el.value : ''; }}
+function saveAgent(id) {{
+  const c = document.querySelector('[data-agent="' + id + '"]');
+  _post('/agents/' + id, {{name: _val(c, 'a-name'), model: _val(c, 'a-model'),
+    system_prompt: _val(c, 'a-prompt')}});
+}}
+function activateAgent(id) {{ _post('/agents/' + id + '/activate', {{}}); }}
+function createAgent() {{
+  const f = document.getElementById('new-agent');
+  _post('/agents', {{role: _val(f, 'n-role'), name: _val(f, 'n-name'), model: _val(f, 'n-model'),
+    system_prompt: _val(f, 'n-prompt'), activate: f.querySelector('.n-activate').checked}});
+}}
 </script>
 </body></html>"""
 
@@ -392,6 +440,75 @@ def _activity_body(db: Session) -> str:
     </div>"""
 
 
+def _workflow_diagram() -> str:
+    lanes = []
+    for lane, nodes in _PIPELINE:
+        boxes = []
+        for i, (name, kind, model, role) in enumerate(nodes):
+            if i:
+                boxes.append('<div class="arrow">&rarr;</div>')
+            chip = (f'<span class="chip-tier tier-ai">{html.escape(model)}</span>' if kind == "llm"
+                    else '<span class="node-kind">deterministic</span>')
+            boxes.append(
+                f'<div class="node{" llm" if kind == "llm" else ""}">'
+                f'<div class="node-name">{html.escape(name)}</div>{chip}'
+                f'<div class="node-role">{html.escape(role)}</div></div>')
+        lanes.append(f'<div class="lane"><div class="lane-label">{html.escape(lane)}</div>'
+                     f'<div class="flow">{"".join(boxes)}</div></div>')
+    return f'<div class="card diagram">{"".join(lanes)}</div>'
+
+
+def _agents_body(db: Session) -> str:
+    cards = []
+    for a in agents.list_agents(db):
+        role_label = agents.ROLE_LABELS.get(a.role, a.role)
+        right = ('<span class="pill pill-on">active</span>' if a.is_active
+                 else f'<button class="btn btn-sm btn-secondary" onclick="activateAgent({a.id})">Make active</button>')
+        cards.append(f"""
+        <div class="card" data-agent="{a.id}">
+          <div class="card-head">
+            <div class="who"><div class="name">{html.escape(a.name)}</div>
+              <div class="sub">{html.escape(role_label)} - v{a.version}</div></div>
+            {right}
+          </div>
+          <div class="field"><label>Name</label>
+            <input class="inp a-name" value="{html.escape(a.name)}"></div>
+          <div class="field"><label>Model</label>
+            <input class="inp a-model" value="{html.escape(a.model)}"></div>
+          <div class="field"><label>System prompt</label>
+            <textarea class="ta a-prompt" rows="6">{html.escape(a.system_prompt)}</textarea></div>
+          <div class="actions">
+            <button class="btn btn-sm btn-primary" onclick="saveAgent({a.id})">Save changes</button></div>
+        </div>""")
+
+    role_opts = "".join(
+        f'<option value="{r}">{html.escape(agents.ROLE_LABELS[r])}</option>' for r in agents.ROLES)
+    new_form = f"""
+    <div class="card" id="new-agent">
+      <div class="section-title"><h2>Spin up a fresh agent</h2>
+        <span class="t-meta">a new prompt/model variant for a role</span></div>
+      <div class="grid-2">
+        <div class="field"><label>Role</label><select class="sel n-role">{role_opts}</select></div>
+        <div class="field"><label>Name</label>
+          <input class="inp n-name" placeholder="e.g. Warm dermatology copywriter"></div>
+      </div>
+      <div class="field"><label>Model</label>
+        <input class="inp n-model" placeholder="claude-sonnet-4-6"></div>
+      <div class="field"><label>System prompt</label>
+        <textarea class="ta n-prompt" rows="6" placeholder="Instructions for this agent..."></textarea></div>
+      <label class="check"><input type="checkbox" class="n-activate"> Make this the active agent for its role</label>
+      <div class="actions"><button class="btn btn-sm btn-primary" onclick="createAgent()">Create agent</button></div>
+    </div>"""
+
+    return f"""
+    <div class="section-title"><h2>Workflow</h2><span class="t-meta">how the agents hand off</span></div>
+    {_workflow_diagram()}
+    <div class="section-title" style="margin-top:26px"><h2>Agents</h2>
+      <span class="t-meta">edit a prompt, then Save - it drives the live Claude agent</span></div>
+    {"".join(cards)}
+    {new_form}"""
+
+
 def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(title="Certuma Reach dashboard", version="0.2")
@@ -421,6 +538,43 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
         return _shell(db, "/activity", eyebrow="Pipeline", title="Activity",
                       subtitle="The send-to-activation funnel, suppressions, and recent lifecycle events.",
                       body=_activity_body(db))
+
+    @app.get("/agents", response_class=HTMLResponse)
+    def agents_page(db: Session = Depends(get_db)):
+        agents.ensure_seeded(db)
+        db.commit()
+        return _shell(db, "/agents", eyebrow="Configuration", title="Agent Studio",
+                      subtitle="See how the agents hand off, tune each agent's prompt, and spin up new ones.",
+                      body=_agents_body(db))
+
+    @app.post("/agents")
+    def create_agent(body: AgentCreateBody, db: Session = Depends(get_db)):
+        try:
+            a = agents.create_agent(db, role=body.role, name=body.name, model=body.model,
+                                    system_prompt=body.system_prompt, activate=body.activate)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        db.commit()
+        return {"id": a.id, "role": a.role, "is_active": a.is_active}
+
+    @app.post("/agents/{agent_id}")
+    def update_agent(agent_id: int, body: AgentUpdateBody, db: Session = Depends(get_db)):
+        try:
+            a = agents.update_agent(db, agent_id, name=body.name, model=body.model,
+                                    system_prompt=body.system_prompt)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="agent not found")
+        db.commit()
+        return {"id": a.id, "version": a.version}
+
+    @app.post("/agents/{agent_id}/activate")
+    def activate_agent(agent_id: int, db: Session = Depends(get_db)):
+        try:
+            a = agents.activate_agent(db, agent_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="agent not found")
+        db.commit()
+        return {"id": a.id, "is_active": True}
 
     @app.get("/health")
     def health(db: Session = Depends(get_db)):

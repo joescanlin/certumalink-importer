@@ -515,3 +515,122 @@ strong {
 }
 .lint-result.ok { color: var(--tier-done); }
 .lint-result.bad { color: var(--danger); }
+
+/* ---- agent workflow diagram ---- */
+.diagram {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.lane {
+  display: flex;
+  align-items: stretch;
+  gap: 14px;
+}
+.lane-label {
+  flex: none;
+  width: 78px;
+  padding-top: 14px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted-fg);
+}
+.flow {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 1;
+  min-width: 0;
+}
+.node {
+  flex: 1 1 0;
+  min-width: 150px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card-sm);
+  padding: 12px 13px;
+}
+.node.llm {
+  background: var(--accent-bg);
+  border-color: var(--accent-tint, #d6e1e5);
+}
+.node-name {
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: -0.01em;
+  margin-bottom: 6px;
+}
+.node-kind {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: var(--r-chip);
+  background: var(--muted);
+  color: var(--muted-fg);
+}
+.node-role {
+  margin-top: 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--muted-fg);
+}
+.arrow {
+  align-self: center;
+  color: var(--muted-fg-2);
+  font-size: 15px;
+  flex: none;
+}
+
+/* ---- form fields (agent prompt editor) ---- */
+.field {
+  margin-bottom: 12px;
+}
+.field label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted-fg);
+  margin-bottom: 5px;
+}
+.inp {
+  width: 100%;
+  height: var(--h-input);
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-input);
+  background: var(--card);
+  font-size: 13px;
+  color: var(--fg);
+}
+.ta {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-input);
+  background: var(--card);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--fg);
+  resize: vertical;
+  font-family: var(--font);
+}
+.inp:focus, .ta:focus, .sel:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--fg-2);
+  margin: 4px 0 12px;
+}

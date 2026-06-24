@@ -19,9 +19,11 @@ from certuma_core.copy_schema import COPY_OUTPUT_SCHEMA, SeedFacts
 
 from .provider import CopyOutput, TokenAudit
 
-__all__ = ["AnthropicCopyProvider", "CopyRefused"]
+__all__ = ["AnthropicCopyProvider", "CopyRefused", "SYSTEM_PROMPT"]
 
-_SYSTEM = (
+# The default system prompt. Editable per-agent from the Agent Studio (stored in the agent table);
+# this is the canonical fallback and the seed value.
+SYSTEM_PROMPT = (
     "You are Certuma, drafting a single cold outreach email to a physician from an APPROVED "
     "template. Rules: (1) Fill ONLY the personalization tokens using the provided facts; use no "
     "fact that is not provided. (2) Leave the literal tokens {claim_url}, {unsubscribe_url}, and "
@@ -39,9 +41,10 @@ class CopyRefused(RuntimeError):
 class AnthropicCopyProvider:
     name = "anthropic"
 
-    def __init__(self, api_key: str, *, client=None):
+    def __init__(self, api_key: str, *, client=None, system: str = ""):
         self._api_key = api_key
         self._client = client
+        self._system = system or SYSTEM_PROMPT
 
     def _get_client(self):
         if self._client is None:
@@ -66,7 +69,7 @@ class AnthropicCopyProvider:
         response = client.messages.create(
             model=model,
             max_tokens=16000,
-            system=_SYSTEM,
+            system=self._system,
             messages=[{"role": "user", "content": user}],
             output_config={"format": {"type": "json_schema", "schema": COPY_OUTPUT_SCHEMA}},
         )

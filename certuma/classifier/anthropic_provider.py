@@ -16,11 +16,12 @@ import json
 
 from .provider import CLASSIFY_SCHEMA, INTENTS, ClassificationResult
 
-__all__ = ["AnthropicReplyClassifier", "HAIKU"]
+__all__ = ["AnthropicReplyClassifier", "HAIKU", "SYSTEM_PROMPT"]
 
 HAIKU = "claude-haiku-4-5"
 
-_SYSTEM = (
+# The default system prompt. Editable per-agent from the Agent Studio (stored in the agent table).
+SYSTEM_PROMPT = (
     "You classify a single inbound email reply from a physician (or their staff) to a cold "
     "outreach message. Return ONLY the strict JSON shape requested. Choose exactly one intent from: "
     + ", ".join(INTENTS) + ". Guidance: 'unsubscribe' = an explicit opt-out / remove request; "
@@ -35,10 +36,11 @@ _SYSTEM = (
 class AnthropicReplyClassifier:
     name = "anthropic"
 
-    def __init__(self, api_key: str, *, client=None, model: str = HAIKU):
+    def __init__(self, api_key: str, *, client=None, model: str = HAIKU, system: str = ""):
         self._api_key = api_key
         self._client = client
         self._model = model
+        self._system = system or SYSTEM_PROMPT
 
     def _get_client(self):
         if self._client is None:
@@ -53,7 +55,7 @@ class AnthropicReplyClassifier:
         response = client.messages.create(
             model=self._model,
             max_tokens=1024,
-            system=_SYSTEM,
+            system=self._system,
             messages=[{"role": "user", "content": user}],
             output_config={"format": {"type": "json_schema", "schema": CLASSIFY_SCHEMA}},
         )
