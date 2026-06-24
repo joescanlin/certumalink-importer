@@ -6,7 +6,7 @@ PY := $(VENV)/bin/python
 ALEMBIC := $(VENV)/bin/alembic
 export CERTUMA_DATABASE_URL ?= postgresql+psycopg://certuma:certuma@localhost:55433/certuma
 
-.PHONY: venv db-up db-wait db-down db-reset migrate downgrade db-shell test test-core test-db all-tests demo clean
+.PHONY: venv db-up db-wait db-down db-reset migrate downgrade db-shell test test-core test-db all-tests demo tick clean
 
 venv:                ## create the app venv and install deps
 	python3 -m venv $(VENV)
@@ -52,6 +52,9 @@ all-tests: db-up migrate test test-db  ## everything, against a live DB
 
 demo:                ## run the end-to-end Assisted-loop demo (needs db-up migrate + Mailpit)
 	PYTHONPATH=.:src $(PY) -m certuma.demo
+
+tick:                ## run one autonomous scheduler tick (propose -> auto-send -> cadence -> poll -> SLA)
+	PYTHONPATH=.:src $(PY) -m certuma.scheduler
 
 clean:
 	find . -name __pycache__ -type d -prune -exec rm -rf {} +
