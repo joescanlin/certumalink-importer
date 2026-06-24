@@ -24,8 +24,8 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from certuma import (agents, engagement, gate, inbound, intelligence, monitor, orchestrator,
-                     reporting)
+from certuma import (agents, engagement, gate, inbound, intelligence, learning, monitor,
+                     orchestrator, reporting)
 from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
 from certuma.reporting import queries as _rq
@@ -380,9 +380,26 @@ def _studio_body(db: Session) -> str:
           </div>
         </div>""")
     body = "".join(cards) if cards else '<div class="empty">No templates yet.</div>'
+
+    perf = learning.variant_performance(db)
+    winner = learning.winning_variant(db)
+    perf_rows = "".join(
+        f'<tr><td><div class="cell-title">{html.escape(str(r["variant"]))}'
+        f'{" &#11088; winner" if r["variant"] == winner else ""}</div></td>'
+        f'<td class="tabular">{r["sent"]}</td><td class="tabular">{r["replied"]}</td>'
+        f'<td class="tabular">{r["activated"]}</td>'
+        f'<td class="tabular">{("-" if r["activation_rate"] is None else str(r["activation_rate"]) + "%")}</td></tr>'
+        for r in perf
+    ) or '<tr><td colspan="5" class="empty-cell">No variant data yet (one approved template, no A/B).</td></tr>'
+
     return f"""
     <div class="section-title"><h2>Templates</h2><span class="t-meta">{len(templates)} total</span></div>
-    {body}"""
+    {body}
+    <div class="section-title" style="margin-top:22px"><h2>Variant performance</h2>
+      <span class="t-meta">A/B by activation rate{(" - winner: " + html.escape(winner)) if winner else ""}</span></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>Variant</th><th>Sent</th><th>Replied</th><th>Activated</th><th>Activation rate</th></tr></thead>
+      <tbody>{perf_rows}</tbody></table></div>"""
 
 
 def _activity_body(db: Session) -> str:
