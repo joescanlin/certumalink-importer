@@ -694,7 +694,14 @@ def _analytics_body(db: Session) -> str:
     <div class="section-title" style="margin-top:22px"><h2>Unit economics</h2></div>
     <div class="kpis" style="grid-template-columns:repeat(3,1fr)">{eco_kpis}</div>
     {_dim_table("Conversion by specialty", _rq.by_dimension(db, "specialty"))}
-    {_dim_table("Conversion by campaign", _rq.by_dimension(db, "campaign"))}"""
+    {_dim_table("Conversion by campaign", _rq.by_dimension(db, "campaign"))}
+    <div class="section-title" style="margin-top:22px"><h2>Touches by channel</h2></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>Channel</th><th>Touches</th><th>Delivered</th></tr></thead>
+      <tbody>{"".join(f'<tr><td><div class="cell-title">{html.escape(c["channel"])}</div></td>'
+                      f'<td class="tabular">{c["touches"]}</td><td class="tabular">{c["delivered"]}</td></tr>'
+                      for c in _rq.touches_by_channel(db))
+              or '<tr><td colspan=3 class="empty-cell">No touches yet.</td></tr>'}</tbody></table></div>"""
 
 
 def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:

@@ -48,7 +48,7 @@ _FACT_TOUCH = """
 INSERT INTO reporting.fact_touch
     (message_id, npi, campaign, specialty, state, channel, variant_id, cadence_step,
      sent_at, sent_date, delivered, bounced, send_cost)
-SELECT m.id, m.npi, m.campaign, p.primary_specialty, p.practice_state, 'email', m.variant_id,
+SELECT m.id, m.npi, m.campaign, p.primary_specialty, p.practice_state, m.channel, m.variant_id,
        m.cadence_step, m.sent_at,
        CASE WHEN m.sent_at IS NOT NULL THEN (m.sent_at AT TIME ZONE 'UTC')::date END,
        m.delivered, m.bounced, :send_cost

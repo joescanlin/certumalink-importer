@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 __all__ = ["DIMENSIONS", "funnel_totals", "by_dimension", "unit_economics",
-           "time_to_activation_days", "rebuilt_at"]
+           "time_to_activation_days", "rebuilt_at", "touches_by_channel"]
 
 # whitelist of group-by columns (the value is interpolated into SQL, so it MUST be validated)
 DIMENSIONS = {"specialty", "state", "campaign"}
@@ -97,3 +97,10 @@ def time_to_activation_days(session: Session) -> Optional[float]:
 
 def rebuilt_at(session: Session):
     return session.execute(text("SELECT rebuilt_at FROM reporting.meta WHERE id = 1")).scalar()
+
+
+def touches_by_channel(session: Session) -> List[dict]:
+    return [dict(r) for r in session.execute(text(
+        "SELECT channel, count(*) AS touches, count(*) FILTER (WHERE delivered) AS delivered "
+        "FROM reporting.fact_touch GROUP BY channel ORDER BY touches DESC"
+    )).mappings()]
