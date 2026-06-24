@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover
 if HAVE_SA:
     from certuma import active_seed
     from certuma.config import Settings
-    from certuma.db.models import Campaign, Lead
+    from certuma.db.models import Campaign, ClinicianSignal, Lead, SupportTicket
 
 DB_URL = os.environ.get("CERTUMA_DATABASE_URL") or (Settings().database_url if HAVE_SA else "")
 
@@ -61,7 +61,8 @@ class ActiveSeedTests(unittest.TestCase):
         # the seed spans many states + activations + escalations
         self.assertGreaterEqual(counts.get("physician_activated", 0), 1)
         self.assertGreaterEqual(counts.get("needs_review", 0), 1)
-        lifecycle = {k for k in counts if k not in ("total", "pending_send_approvals")}
+        _support_keys = ("support_tickets", "support_signals", "support_escalations")
+        lifecycle = {k for k in counts if k not in ("total", "pending_send_approvals") + _support_keys}
         self.assertGreaterEqual(len(lifecycle), 6)  # a broad spread of states
         seeded = self.session.execute(
             select(func.count()).select_from(Lead).where(Lead.npi.like("30%"))).scalar()
@@ -70,6 +71,15 @@ class ActiveSeedTests(unittest.TestCase):
         activated = self.session.execute(text(
             "SELECT count(*) FROM reporting.fact_lead_funnel WHERE activated AND npi LIKE '30%'")).scalar()
         self.assertGreaterEqual(activated, 1)
+        # the support agents ran: tickets were filed and support->sales signals emitted
+        self.assertGreaterEqual(counts.get("support_tickets", 0), 1)
+        self.assertGreaterEqual(counts.get("support_signals", 0), 1)
+        tickets = self.session.execute(
+            select(func.count()).select_from(SupportTicket).where(SupportTicket.npi.like("30%"))).scalar()
+        self.assertEqual(tickets, counts["support_tickets"])
+        support_sigs = self.session.execute(select(func.count()).select_from(ClinicianSignal).where(
+            ClinicianSignal.source == "support", ClinicianSignal.npi.like("30%"))).scalar()
+        self.assertGreaterEqual(support_sigs, 1)
 
 
 if __name__ == "__main__":

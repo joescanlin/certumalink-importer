@@ -29,8 +29,8 @@ if HAVE_DEPS:
     from certuma import reply_drafter
     from certuma.config import Settings
     from certuma.api.app import create_app, get_db
-    from certuma.db.models import (AccessLog, Approval, Campaign, Contact, Event, Lead, Mailbox,
-                                   Message, Prospect, Suppression, Thread)
+    from certuma.db.models import (AccessLog, Approval, Campaign, ClinicianSignal, Contact, Event,
+                                   Lead, Mailbox, Message, Prospect, Suppression, SupportTicket, Thread)
     from certuma.email.provider import SendResult
     from certuma import auth
 
@@ -501,6 +501,58 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(ok.status_code, 200)
         self.assertEqual(c.post("/events/email", json={"event_type": "opened", "dedup_key": "w3"},
                                 headers={"X-Certuma-Webhook-Secret": "wrong"}).status_code, 401)
+
+    # ---- Customer support agents (Phase 4 / support) ----
+    def test_support_page_renders_tickets_and_sales_signals(self):
+        from certuma import support
+        npi = "1000000020"
+        self.session.add(Prospect(npi=npi, display_name="Dr Support", primary_specialty="Dermatology"))
+        self.session.flush()
+        support.handle_ticket(self.session, npi=npi,
+                              body="We love it - can you add more seats for our whole practice?")
+        self.session.flush()
+        r = self.client.get("/support")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Support tickets", "Sales signals from support", "Dr Support",
+                       "expansion interest", "Upsell lead"):
+            self.assertIn(marker, r.text)
+
+    def test_support_ticket_endpoint_classifies_and_feeds_the_graph(self):
+        npi = "1000000021"
+        self.session.add(Prospect(npi=npi, display_name="Dr Ticket"))
+        self.session.flush()
+        r = self.client.post("/support/ticket", json={
+            "npi": npi, "subject": "Help", "body": "I am frustrated and want to cancel for a refund."})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["intent"], "complaint")
+        self.assertEqual(body["status"], "escalated")
+        self.assertEqual(body["sales_signal"], "churn_risk_support")
+        # the support interaction wrote a sales signal into the shared knowledge graph
+        sig = self.session.execute(select(ClinicianSignal).where(
+            ClinicianSignal.npi == npi, ClinicianSignal.source == "support")).scalar()
+        self.assertIsNotNone(sig)
+        # and a ticket row exists
+        t = self.session.execute(select(SupportTicket).where(SupportTicket.npi == npi)).scalar()
+        self.assertEqual(t.intent, "complaint")
+
+    def test_support_ticket_requires_auth_but_accepts_webhook_secret(self):
+        app = create_app(settings=Settings(session_secret=TEST_SECRET, webhook_secret="wh-secret"))
+        app.dependency_overrides[get_db] = self._override
+        npi = "1000000022"
+        self.session.add(Prospect(npi=npi, display_name="Dr Machine"))
+        self.session.flush()
+        c = TestClient(app)  # NO session cookie (a machine posting from the portal)
+        self.assertEqual(c.post("/support/ticket", json={"npi": npi, "body": "how do i edit?"}).status_code, 401)
+        ok = c.post("/support/ticket", json={"npi": npi, "body": "I love it, this is amazing!"},
+                    headers={"X-Certuma-Webhook-Secret": "wh-secret"})
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(ok.json()["sales_signal"], "advocate")
+        self.assertEqual(c.post("/support/ticket", json={"npi": npi, "body": "x"},
+                                headers={"X-Certuma-Webhook-Secret": "wrong"}).status_code, 401)
+
+    def test_support_nav_link_present(self):
+        self.assertIn('href="/support"', self.client.get("/").text)
 
     # ---- inbound reply webhook (Phase 2) ----
     def test_inbound_reply_classifies_and_transitions(self):

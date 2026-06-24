@@ -27,13 +27,14 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from certuma import (agents, auth, engagement, gate, inbound, intelligence, learning, monitor,
-                     orchestrator, reporting)
+                     orchestrator, reporting, support)
 from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
 from certuma.observability import get_logger
 from certuma.reporting import queries as _rq
-from certuma.db.models import (AccessLog, Approval, Campaign, ConsoleUser, Event, KillSwitch, Lead,
-                               Message, Prospect, Suppression, Template, Thread)
+from certuma.db.models import (AccessLog, Approval, Campaign, ClinicianSignal, ConsoleUser, Event,
+                               KillSwitch, Lead, Message, Prospect, Suppression, SupportTicket,
+                               Template, Thread)
 
 _LOG = get_logger("certuma.api")
 from certuma.db.session import make_session_factory
@@ -41,7 +42,7 @@ from certuma.email import get_provider
 from certuma.templates import TemplateNotFound, approve_template, lint_template
 
 # machine endpoints a provider may post to with the webhook secret (instead of a user session)
-_WEBHOOK_PATHS = ("/events/email", "/inbound/reply", "/inbound/esp")
+_WEBHOOK_PATHS = ("/events/email", "/inbound/reply", "/inbound/esp", "/support/ticket")
 
 # a 1x1 transparent GIF returned by the open-tracking pixel endpoint
 _PIXEL_GIF = (b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00"
@@ -113,6 +114,13 @@ class ReplyBody(BaseModel):
     occurred_at: Optional[str] = None
 
 
+class SupportTicketBody(BaseModel):
+    body: str
+    npi: Optional[str] = None
+    subject: str = ""
+    channel: str = "portal"
+
+
 class AgentCreateBody(BaseModel):
     role: str
     name: str
@@ -131,8 +139,9 @@ _TIER_CLASS = {"high": "tier-live", "medium": "tier-review", "low": "tier-new"}
 _AUTONOMY_LEVELS = ("assisted", "supervised", "autonomous")
 # nav: (label, path). Only implemented screens are listed so there are no dead links.
 _NAV = (("Approvals", "/"), ("Recommended", "/recommended"), ("Escalations", "/escalations"),
-        ("Campaigns", "/campaigns"), ("Templates", "/studio"), ("Agents", "/agents"),
-        ("Analytics", "/analytics"), ("Leadership", "/leadership"), ("Activity", "/activity"))
+        ("Support", "/support"), ("Campaigns", "/campaigns"), ("Templates", "/studio"),
+        ("Agents", "/agents"), ("Analytics", "/analytics"), ("Leadership", "/leadership"),
+        ("Activity", "/activity"))
 
 # The agent workflow, for the Agent Studio diagram: (lane, [(name, kind, model, role)]).
 # kind 'llm' = a tunable Claude agent (teal); 'node' = a deterministic step (no prompt).
@@ -152,6 +161,11 @@ _PIPELINE = (
     ("Control", (
         ("Orchestrator + Policy", "node", "", "Propose sends, apply autonomy, escalate exceptions."),
         ("Ledger-writer", "node", "", "The single writer of lead status; every move guarded and audited."),
+    )),
+    ("Support", (
+        ("Support Classifier", "llm", "Haiku", "Label onboarding/support messages from physicians."),
+        ("Support Responder", "node", "", "Answer routine tickets; escalate complaints and bugs."),
+        ("Signal Feedback", "node", "", "Turn support into sales signals (upsell / referral / churn)."),
     )),
 )
 
@@ -626,6 +640,65 @@ def _escalations_body(db: Session) -> str:
       <thead><tr><th>Lead</th><th>Status</th></tr></thead><tbody>{nr_table}</tbody></table></div>"""
 
 
+_SUPPORT_STATUS_PILL = {"open": "pill-warn", "escalated": "pill-warn", "answered": "pill-on",
+                        "resolved": "pill-on"}
+_SUPPORT_SIGNAL_LABEL = {"expansion_intent": "Upsell lead", "advocate": "Referral lead",
+                         "churn_risk_support": "Churn risk"}
+_SUPPORT_SIGNAL_PILL = {"expansion_intent": "tier-live", "advocate": "tier-done",
+                        "churn_risk_support": "tier-review"}
+
+
+def _support_body(db: Session) -> str:
+    tickets = db.execute(
+        select(SupportTicket, Prospect)
+        .join(Prospect, SupportTicket.npi == Prospect.npi, isouter=True)
+        .order_by(SupportTicket.id.desc()).limit(40)
+    ).all()
+    trows = []
+    for t, p in tickets:
+        name = (p.display_name if p else None) or (t.npi or "unknown")
+        intent = (t.intent or "unclassified").replace("_", " ")
+        status_pill = _SUPPORT_STATUS_PILL.get(t.status, "pill-off")
+        resolution = (html.escape(t.answer) if t.answer else
+                      ("escalated to a human" if t.status == "escalated" else ""))
+        trows.append(
+            f'<tr><td><div class="cell-title">{html.escape(name)}</div>'
+            f'<div class="t-meta">{html.escape(t.body or "")[:90]}</div></td>'
+            f'<td><span class="chip-tier tier-ai">{html.escape(intent)}</span></td>'
+            f'<td><span class="pill {status_pill}">{html.escape(t.status)}</span></td>'
+            f'<td class="t-meta">{resolution}</td></tr>')
+    ticket_rows = "".join(trows) or '<tr><td colspan="4" class="empty-cell">No support tickets yet.</td></tr>'
+
+    sigs = db.execute(
+        select(ClinicianSignal, Prospect)
+        .join(Prospect, ClinicianSignal.npi == Prospect.npi, isouter=True)
+        .where(ClinicianSignal.source == "support").order_by(ClinicianSignal.id.desc()).limit(40)
+    ).all()
+    srows = []
+    for s, p in sigs:
+        name = (p.display_name if p else None) or (s.npi or "")
+        label = _SUPPORT_SIGNAL_LABEL.get(s.signal_type, s.signal_type)
+        pill = _SUPPORT_SIGNAL_PILL.get(s.signal_type, "tier-new")
+        srows.append(
+            f'<tr><td><div class="cell-title">{html.escape(name)}</div></td>'
+            f'<td><span class="chip-tier {pill}">{html.escape(label)}</span></td>'
+            f'<td class="t-meta">from a {html.escape((s.value or "").replace("_", " "))} message</td></tr>')
+    signal_rows = "".join(srows) or ('<tr><td colspan="3" class="empty-cell">No sales signals from '
+                                     'support yet.</td></tr>')
+
+    return f"""
+    <div class="section-title"><h2>Support tickets</h2>
+      <span class="t-meta">classified, answered or escalated by the support agents</span></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>Clinician</th><th>Intent</th><th>Status</th><th>Resolution</th></tr></thead>
+      <tbody>{ticket_rows}</tbody></table></div>
+    <div class="section-title" style="margin-top:24px"><h2>Sales signals from support</h2>
+      <span class="t-meta">support interactions feeding the sales knowledge graph</span></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>Clinician</th><th>Signal</th><th>Source</th></tr></thead>
+      <tbody>{signal_rows}</tbody></table></div>"""
+
+
 def _dim_table(title: str, rows: list) -> str:
     body = "".join(
         f'<tr><td><div class="cell-title">{html.escape(str(r["label"]))}</div></td>'
@@ -661,7 +734,7 @@ def _recommended_body(db: Session) -> str:
     body = "".join(items) if items else '<tr><td colspan="4" class="empty-cell">No open leads.</td></tr>'
     return f"""
     <div class="section-title"><h2>Recommended actions</h2>
-      <span class="t-meta">open leads ranked by fit (signals + trigger)</span></div>
+      <span class="t-meta">open leads plus support-driven upsell &amp; retention, ranked by fit</span></div>
     <div class="card pad0"><table class="tbl">
       <thead><tr><th>Clinician</th><th>Fit</th><th>Status</th><th>Next best action</th></tr></thead>
       <tbody>{body}</tbody></table></div>"""
@@ -838,6 +911,21 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
                       subtitle="Open leads ranked by fit (knowledge-graph signals), each with its "
                                "next-best-action.",
                       body=_recommended_body(db))
+
+    @app.get("/support", response_class=HTMLResponse)
+    def support_page(db: Session = Depends(get_db)):
+        return _shell(db, "/support", eyebrow="Customer success", title="Support",
+                      subtitle="The support agents classify onboarding questions, answer or escalate, "
+                               "and feed sales signals back into the knowledge graph.",
+                      body=_support_body(db))
+
+    @app.post("/support/ticket")
+    def support_ticket(body: SupportTicketBody, db: Session = Depends(get_db)):
+        ticket, outcome = support.handle_ticket(db, npi=body.npi, body=body.body, subject=body.subject,
+                                                channel=body.channel)
+        db.commit()
+        return {"ticket_id": ticket.id, "intent": outcome.intent, "status": outcome.status,
+                "sales_signal": outcome.sales_signal}
 
     @app.get("/escalations", response_class=HTMLResponse)
     def escalations_page(db: Session = Depends(get_db)):
