@@ -36,6 +36,7 @@ from certuma import breakers, gate
 from certuma.db.models import Event, Lead, Message, Suppression
 from certuma.ledger_writer import IllegalActor, transition
 from certuma.observability import METRICS, emit, get_logger
+from certuma_core import cadence
 from certuma_core.status import IllegalTransition
 
 __all__ = ["IngestResult", "record_event", "ingest_event", "activate_lead",
@@ -217,6 +218,8 @@ def ingest_event(
                                 campaign=(lead.campaign if lead else None), is_bad=False)
         if lead is not None and _try_transition(session, lead, "awaiting_reply",
                                                 actor="monitor", reason_code="delivered"):
+            # schedule the first follow-up; the cadence engine acts when next_action_at is due
+            lead.next_action_at = cadence.next_action_after(lead.cadence_step, when)
             result = IngestResult(duplicate=False, event_id=event_id, transitioned_to="awaiting_reply")
 
     elif event_type == "bounced":
