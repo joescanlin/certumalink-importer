@@ -277,7 +277,7 @@ def _approvals_body(db: Session) -> str:
         select(Approval, Prospect)
         .join(Lead, Approval.lead_id == Lead.id)
         .join(Prospect, Lead.npi == Prospect.npi)
-        .where(Approval.state == "pending")
+        .where(Approval.state == "pending", Approval.proposed_action != "reply")  # replies live on Escalations
         .order_by(Approval.created_at)
     ).all()
 

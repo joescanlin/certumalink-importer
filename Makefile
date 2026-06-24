@@ -6,7 +6,7 @@ PY := $(VENV)/bin/python
 ALEMBIC := $(VENV)/bin/alembic
 export CERTUMA_DATABASE_URL ?= postgresql+psycopg://certuma:certuma@localhost:55433/certuma
 
-.PHONY: venv db-up db-wait db-down db-reset migrate downgrade db-shell test test-core test-db all-tests demo tick rebuild evidence create-user parity clean
+.PHONY: venv db-up db-wait db-down db-reset migrate downgrade db-shell test test-core test-db all-tests demo tick rebuild evidence create-user parity seed-active clean
 
 venv:                ## create the app venv and install deps
 	python3 -m venv $(VENV)
@@ -68,6 +68,9 @@ evidence:            ## export the governed Series-A evidence datasets (CSV) to 
 
 parity:              ## run the Phase 3 parity demo (signals -> enrich -> autopilot -> learning -> evidence)
 	PYTHONPATH=.:src $(PY) -m certuma.parity_demo
+
+seed-active:         ## seed a large active-campaign dataset for the dashboard (commits)
+	PYTHONPATH=.:src $(PY) -m certuma.active_seed
 
 clean:
 	find . -name __pycache__ -type d -prune -exec rm -rf {} +
