@@ -24,9 +24,10 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from certuma import agents, gate, inbound, monitor, orchestrator
+from certuma import agents, gate, inbound, monitor, orchestrator, reporting
 from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
+from certuma.reporting import queries as _rq
 from certuma.db.models import (Approval, Campaign, Event, KillSwitch, Lead, Message, Prospect,
                                Suppression, Template)
 from certuma.db.session import make_session_factory
@@ -117,7 +118,8 @@ _TIER_CLASS = {"high": "tier-live", "medium": "tier-review", "low": "tier-new"}
 _AUTONOMY_LEVELS = ("assisted", "supervised", "autonomous")
 # nav: (label, path). Only implemented screens are listed so there are no dead links.
 _NAV = (("Approvals", "/"), ("Escalations", "/escalations"), ("Campaigns", "/campaigns"),
-        ("Templates", "/studio"), ("Agents", "/agents"), ("Activity", "/activity"))
+        ("Templates", "/studio"), ("Agents", "/agents"), ("Analytics", "/analytics"),
+        ("Activity", "/activity"))
 
 # The agent workflow, for the Agent Studio diagram: (lane, [(name, kind, model, role)]).
 # kind 'llm' = a tunable Claude agent (teal); 'node' = a deterministic step (no prompt).
@@ -236,6 +238,7 @@ function saveAgent(id) {{
     system_prompt: _val(c, 'a-prompt')}});
 }}
 function activateAgent(id) {{ _post('/agents/' + id + '/activate', {{}}); }}
+function rebuildAnalytics() {{ _post('/analytics/rebuild', {{}}); }}
 function createAgent() {{
   const f = document.getElementById('new-agent');
   _post('/agents', {{role: _val(f, 'n-role'), name: _val(f, 'n-name'), model: _val(f, 'n-model'),
@@ -572,6 +575,64 @@ def _escalations_body(db: Session) -> str:
       <thead><tr><th>Lead</th><th>Status</th></tr></thead><tbody>{nr_table}</tbody></table></div>"""
 
 
+def _dim_table(title: str, rows: list) -> str:
+    body = "".join(
+        f'<tr><td><div class="cell-title">{html.escape(str(r["label"]))}</div></td>'
+        f'<td class="tabular">{r["leads"]}</td><td class="tabular">{r["sent"]}</td>'
+        f'<td class="tabular">{r["activated"]}</td>'
+        f'<td class="tabular">{("-" if r["activation_rate"] is None else str(r["activation_rate"]) + "%")}</td></tr>'
+        for r in rows
+    ) or '<tr><td colspan="5" class="empty-cell">No data yet.</td></tr>'
+    return f"""
+    <div class="section-title" style="margin-top:22px"><h2>{html.escape(title)}</h2></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>{html.escape(title.split(' ')[-1].title())}</th><th>Leads</th><th>Sent</th>
+        <th>Activated</th><th>Activation rate</th></tr></thead>
+      <tbody>{body}</tbody></table></div>"""
+
+
+def _analytics_body(db: Session) -> str:
+    f = _rq.funnel_totals(db)
+    eco = _rq.unit_economics(db)
+    ttd = _rq.time_to_activation_days(db)
+    asof = _rq.rebuilt_at(db)
+    asof_str = asof.strftime("%Y-%m-%d %H:%M UTC") if asof else "never (click Rebuild)"
+
+    def rate(v):
+        return "-" if v is None else f"{v}%"
+
+    stages = [("Universe", f["universe"]), ("Enriched", f["enriched"]), ("Sent", f["sent"]),
+              ("Delivered", f["delivered"]), ("Opened", f["opened"]), ("Replied", f["replied"]),
+              ("Activated", f["activated"])]
+    funnel = "".join(
+        f'<div class="kpi"><div class="v">{val}</div><div class="k">{label}</div></div>'
+        for label, val in stages)
+    rates = [("Delivery", rate(f["delivery_rate"])), ("Open", rate(f["open_rate"])),
+             ("Reply", rate(f["reply_rate"])), ("Activation", rate(f["activation_rate"]))]
+    rate_kpis = "".join(
+        f'<div class="kpi"><div class="v">{val}</div><div class="k">{label} rate</div></div>'
+        for label, val in rates)
+    cpa = "-" if eco["cost_per_activation"] is None else f"${eco['cost_per_activation']}"
+    ttd_str = "-" if ttd is None else f"{ttd}d"
+    eco_kpis = (
+        f'<div class="kpi"><div class="v">${eco["total_send_cost"]}</div><div class="k">Total send cost</div></div>'
+        f'<div class="kpi"><div class="v">{cpa}</div><div class="k">Cost / activation</div></div>'
+        f'<div class="kpi"><div class="v">{ttd_str}</div><div class="k">Avg time to activation</div></div>')
+
+    return f"""
+    <div class="head-row" style="margin-bottom:14px">
+      <div class="t-meta">Customer Intelligence as of {html.escape(asof_str)}</div>
+      <button class="btn btn-sm btn-secondary" onclick="rebuildAnalytics()">Rebuild</button>
+    </div>
+    <div class="section-title"><h2>Conversion funnel</h2><span class="t-meta">excludes suppressed</span></div>
+    <div class="kpis" style="grid-template-columns:repeat(7,1fr)">{funnel}</div>
+    <div class="kpis">{rate_kpis}</div>
+    <div class="section-title" style="margin-top:22px"><h2>Unit economics</h2></div>
+    <div class="kpis" style="grid-template-columns:repeat(3,1fr)">{eco_kpis}</div>
+    {_dim_table("Conversion by specialty", _rq.by_dimension(db, "specialty"))}
+    {_dim_table("Conversion by campaign", _rq.by_dimension(db, "campaign"))}"""
+
+
 def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(title="Certuma Reach dashboard", version="0.2")
@@ -602,6 +663,18 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
         return _shell(db, "/studio", eyebrow="Copy", title="Template studio",
                       subtitle="Lint and approve the email templates the copywriter drafts from.",
                       body=_studio_body(db))
+
+    @app.get("/analytics", response_class=HTMLResponse)
+    def analytics_page(db: Session = Depends(get_db)):
+        return _shell(db, "/analytics", eyebrow="Evidence", title="Analytics",
+                      subtitle="Customer Intelligence: which specialties, regions, and campaigns convert.",
+                      body=_analytics_body(db))
+
+    @app.post("/analytics/rebuild")
+    def analytics_rebuild(db: Session = Depends(get_db)):
+        report = reporting.rebuild(db)
+        db.commit()
+        return {"clinicians": report.clinicians, "touches": report.touches, "leads": report.leads}
 
     @app.get("/activity", response_class=HTMLResponse)
     def activity_page(db: Session = Depends(get_db)):

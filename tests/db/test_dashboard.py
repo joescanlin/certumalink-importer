@@ -276,6 +276,30 @@ class DashboardTests(unittest.TestCase):
                        "physician_activated", "opt_out", "delivered"):
             self.assertIn(marker, r.text)
 
+    # ---- Analytics / Customer Intelligence (Phase 3) ----
+    def test_analytics_rebuild_then_render(self):
+        npi = "1000000009"
+        self.session.add(Prospect(npi=npi, display_name="Dr Analytics", primary_specialty="Dermatology",
+                                  practice_state="TX"))
+        self.session.flush()
+        lead = Lead(npi=npi, campaign="dermatology", activation_status="physician_activated",
+                    activation_detected_at=__import__("datetime").datetime(2026, 6, 24, 15,
+                        tzinfo=__import__("datetime").timezone.utc))
+        self.session.add(lead)
+        self.session.flush()
+        self.session.add(Message(lead_id=lead.id, npi=npi, campaign="dermatology", cadence_step=0,
+                                 direction="outbound", delivered=True, esp_message_id="o-an",
+                                 sent_at=lead.activation_detected_at))
+        self.session.flush()
+        # rebuild via the endpoint, then the page reflects it
+        rb = self.client.post("/analytics/rebuild").json()
+        self.assertGreaterEqual(rb["leads"], 1)
+        r = self.client.get("/analytics")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Customer Intelligence", "Conversion funnel", "Universe", "Activation rate",
+                       "Unit economics", "Conversion by specialty", "Dermatology"):
+            self.assertIn(marker, r.text)
+
     # ---- Escalations (Phase 2) ----
     def test_escalations_page_shows_drafted_reply(self):
         npi = "1000000007"
