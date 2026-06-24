@@ -129,7 +129,7 @@ def send_one(
     # idempotency Message written + flushed inside transition(), BEFORE the ESP call
     idempotency = dict(
         lead_id=lead.id, thread_id=thread.id, mailbox_id=mailbox.id, npi=lead.npi,
-        campaign=lead.campaign, cadence_step=lead.cadence_step, direction="outbound",
+        campaign=lead.campaign, cadence_step=lead.cadence_step, direction="outbound", channel="email",
         subject=rendered.subject, body_rendered=rendered.body, variant_id=rendered.variant_id,
     )
     ledger_writer.transition(

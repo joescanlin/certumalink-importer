@@ -26,7 +26,7 @@ from certuma.db.models import Campaign, KillSwitch, Message, Prospect, Suppressi
 from certuma.observability import METRICS, emit, get_logger
 from certuma_core.quiet_hours import is_quiet_hours
 
-__all__ = ["ALLOW", "HOLD", "BLOCK", "GateDecision", "evaluate", "is_suppressed"]
+__all__ = ["ALLOW", "HOLD", "BLOCK", "GateDecision", "evaluate", "is_suppressed", "operational_hold"]
 
 ALLOW = "ALLOW"
 HOLD = "HOLD"
@@ -55,6 +55,24 @@ class GateDecision:
 def is_suppressed(session: Session, npi: Optional[str] = None, email: Optional[str] = None) -> bool:
     """Public suppression check (used by the enricher before spending on enrichment)."""
     return _is_suppressed(session, npi, email)
+
+
+def operational_hold(session: Session, *, npi: Optional[str], campaign: Optional[str] = None) -> Optional[str]:
+    """Channel-AGNOSTIC operational controls: suppression, the global kill switch, and per-campaign
+    pause. Returns a reason ('suppression'|'kill_switch'|'campaign_paused') or None. Non-email
+    channels (e.g. LinkedIn) honor these even though they skip the EMAIL-specific Gate checks
+    (CAN-SPAM completeness, quiet-hours-by-mailbox-TZ, warmup caps, deliverability breakers)."""
+    if _is_suppressed(session, npi, None):
+        return "suppression"
+    if session.execute(select(KillSwitch.is_active).where(KillSwitch.id == 1)).scalar():
+        return "kill_switch"
+    if campaign is not None:
+        paused = session.execute(
+            select(Campaign.is_paused).where(Campaign.name == campaign)
+        ).scalar()
+        if paused:
+            return "campaign_paused"
+    return None
 
 
 def _over_warmup_cap(session: Session, mailbox, when_utc: datetime) -> bool:

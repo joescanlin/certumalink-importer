@@ -194,6 +194,7 @@ class Message(Base):
     campaign = Column(Text, ForeignKey("campaign.name"), nullable=False)
     cadence_step = Column(Integer, nullable=False)
     direction = Column(Text, nullable=False)
+    channel = Column(Text, nullable=False, default="email")  # 'email' | 'linkedin' (P3.8)
     variant_id = Column(Text)
     subject = Column(Text)
     body_rendered = Column(Text)
