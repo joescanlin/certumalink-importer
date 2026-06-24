@@ -168,6 +168,40 @@ class ReportingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             rq.by_dimension(self.session, "drop_table")  # only whitelisted dimensions
 
+    def test_evidence_export_is_governed_and_pii_free(self):
+        from certuma.reporting.export import MemoryExporter, export_evidence
+        npi = "2500000004"
+        self.session.add(Prospect(npi=npi, display_name="Dr Evidence", primary_specialty="Dermatology",
+                                  practice_state="TX"))
+        self.session.flush()
+        lead = Lead(npi=npi, campaign="dermatology", activation_status="physician_activated",
+                    activation_detected_at=WHEN)
+        self.session.add(lead)
+        self.session.flush()
+        self.session.add(Message(lead_id=lead.id, npi=npi, campaign="dermatology", cadence_step=0,
+                                 direction="outbound", sent_at=WHEN, delivered=True, esp_message_id="o-ev"))
+        # a suppressed clinician must be reflected in governance but not leak PII
+        self.session.add(Prospect(npi="2500000098", display_name="Dr Private"))
+        self.session.add(Suppression(npi="2500000098", reason="opt_out"))
+        self.session.flush()
+        reporting.rebuild(self.session, as_of=WHEN)
+
+        exp = MemoryExporter()
+        report = export_evidence(self.session, exporter=exp)
+        for name in ("funnel_totals", "conversion_by_specialty", "conversion_by_campaign",
+                     "conversion_by_region", "unit_economics", "governance_summary"):
+            self.assertIn(name, exp.tables)
+        self.assertGreaterEqual(exp.tables["governance_summary"][0]["suppressed"], 1)
+        # NO row-level PII in any exported dataset
+        pii_cols = {"display_name", "email", "npi", "first_name", "last_name", "body_rendered"}
+        for rows in exp.tables.values():
+            for row in rows:
+                self.assertEqual(set(row.keys()) & pii_cols, set())
+        # the suppressed clinician's name never appears anywhere in the export
+        blob = repr(exp.tables)
+        self.assertNotIn("Dr Private", blob)
+        self.assertNotIn("Dr Evidence", blob)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
