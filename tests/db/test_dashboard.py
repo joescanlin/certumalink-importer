@@ -265,6 +265,64 @@ class DashboardTests(unittest.TestCase):
             self.assertIn(marker, r.text)
         self.assertIn("draft", r.text)  # the seeded placeholder template awaits approval
 
+    # ---- Studio AI compose (Studio compose) ----
+    def test_studio_renders_compose_panel(self):
+        r = self.client.get("/studio")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Compose with AI", "composeTemplate(", "insertComposed(", "Message type",
+                       "claude-opus-4-8", "claude-fable-5", "First touch", "Authored by"):
+            self.assertIn(marker, r.text)
+
+    def test_studio_compose_endpoint_returns_linted_draft(self):
+        r = self.client.post("/studio/compose", json={
+            "message_type": "first_touch", "model": "claude-opus-4-8", "specialty": "Dermatology",
+            "brief": "warm, mention local patients"})
+        self.assertEqual(r.status_code, 200)
+        d = r.json()
+        self.assertTrue(d["ok"])  # the stub draft is compliant
+        self.assertIn("{claim_url}", d["body"])
+        self.assertEqual(d["model"], "claude-opus-4-8")
+        self.assertEqual(d["model_label"], "Opus 4.8")
+        # an unknown message type is a 400
+        self.assertEqual(self.client.post("/studio/compose", json={"message_type": "nope"}).status_code, 400)
+
+    def test_studio_insert_template_creates_a_variant(self):
+        from certuma.db.models import Template
+        body = ("Hi Dr. {last_name}, claim your profile: {claim_url}. "
+                "Unsubscribe: {unsubscribe_url}. {postal_address}")
+        r = self.client.post("/studio/templates", json={
+            "subject": "Your profile is ready", "body": body, "message_type": "first_touch",
+            "model": "claude-sonnet-4-6", "campaign": "dermatology", "approve": True})
+        self.assertEqual(r.status_code, 200)
+        out = r.json()
+        self.assertTrue(out["is_approved"])
+        self.assertEqual(out["model"], "claude-sonnet-4-6")
+        tpl = self.session.get(Template, out["id"])
+        self.assertEqual(tpl.source, "ai")
+        self.assertEqual(tpl.message_type, "first_touch")
+        # a non-compliant body fails to insert-with-approve (400)
+        bad = self.client.post("/studio/templates", json={
+            "subject": "hi", "body": "no tokens here", "message_type": "first_touch",
+            "model": "m", "campaign": "dermatology", "approve": True})
+        self.assertEqual(bad.status_code, 400)
+
+    def test_studio_routes_require_auth(self):
+        c = TestClient(self.app)  # no session cookie
+        self.assertEqual(c.post("/studio/compose", json={"message_type": "first_touch"}).status_code, 401)
+        self.assertEqual(c.post("/studio/templates", json={
+            "subject": "s", "body": "b", "message_type": "first_touch"}).status_code, 401)
+
+    def test_studio_routes_are_read_only_for_leadership(self):
+        c = TestClient(self.app)
+        _auth(c, role="leadership")
+        self.assertEqual(c.post("/studio/compose", json={"message_type": "first_touch"}).status_code, 403)
+        self.assertEqual(c.post("/studio/templates", json={
+            "subject": "s", "body": "b", "message_type": "first_touch"}).status_code, 403)
+
+    def test_studio_compose_rejects_unknown_model(self):
+        r = self.client.post("/studio/compose", json={"message_type": "first_touch", "model": "gpt-4"})
+        self.assertEqual(r.status_code, 400)
+
     # ---- activity / funnel ----
     def test_activity_page_renders_funnel(self):
         from datetime import datetime, timezone

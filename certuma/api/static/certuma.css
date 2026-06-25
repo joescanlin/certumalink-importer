@@ -328,6 +328,8 @@ strong {
   border-radius: var(--r-chip);
   white-space: nowrap;
 }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 2px; }
+.chips:empty { display: none; }
 .tier-review { background: var(--tier-review-bg); color: var(--tier-review); }
 .tier-live { background: var(--tier-live-bg); color: var(--tier-live); }
 .tier-done { background: var(--tier-done-bg); color: var(--tier-done); }

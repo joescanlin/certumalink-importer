@@ -258,6 +258,9 @@ class Template(Base):
     approved_by = Column(Text)
     created_by = Column(Text)
     variant_label = Column(Text, nullable=False, default="")
+    message_type = Column(Text, nullable=False, default="first_touch")  # studio compose
+    model = Column(Text, nullable=False, default="")                    # authoring model id
+    source = Column(Text, nullable=False, default="manual")             # manual | ai
     created_at = Column(_TS, server_default=func.now())
 
 
