@@ -703,3 +703,14 @@ a.rowlink:hover { text-decoration: underline; }
   margin: 4px 0 12px;
 }
 .selcell { width: 34px; text-align: center; }
+
+/* ---- generated documents panel ---- */
+.doc-run {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--muted-fg);
+  padding: 10px 14px 0;
+}
+.docimport-pick { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+.docimport-pick .sel { width: auto; min-width: 150px; }
+#doc-preview:not(:empty) { margin-top: 14px; }
