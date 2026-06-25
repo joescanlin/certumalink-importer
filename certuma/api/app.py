@@ -22,12 +22,13 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from certuma import (agents, auth, engagement, gate, inbound, intelligence, learning, monitor,
-                     orchestrator, reporting, support)
+from certuma import (agents, auth, composer, engagement, gate, inbound, intelligence, learning,
+                     monitor, orchestrator, reporting, support)
 from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
 from certuma.observability import get_logger
@@ -71,6 +72,13 @@ def get_db():
         db.close()
 
 
+def _actor(request: Request, db: Session) -> str:
+    """The authenticated console username for audit attribution, or 'console' for a machine/unknown."""
+    session = getattr(request, "state", None) and getattr(request.state, "user", None) or {}
+    user = db.get(ConsoleUser, session["user_id"]) if session.get("user_id") else None
+    return user.username if user else "console"
+
+
 class KillBody(BaseModel):
     active: bool
     set_by: Optional[int] = None
@@ -93,6 +101,24 @@ class DecisionBody(BaseModel):
 
 class ApproveTemplateBody(BaseModel):
     approved_by: str
+
+
+class ComposeBody(BaseModel):
+    message_type: str
+    model: str = composer.DEFAULT_MODEL
+    brief: str = Field("", max_length=2000)
+    campaign: Optional[str] = None
+    specialty: str = Field("", max_length=200)
+
+
+class InsertTemplateBody(BaseModel):
+    subject: str = Field(..., max_length=300)
+    body: str = Field(..., max_length=8000)
+    message_type: str
+    model: str = Field("", max_length=80)
+    campaign: Optional[str] = None
+    variant_label: str = Field("", max_length=8)
+    approve: bool = False
 
 
 class EmailEventBody(BaseModel):
@@ -275,6 +301,36 @@ function createAgent() {{
   _post('/agents', {{role: _val(f, 'n-role'), name: _val(f, 'n-name'), model: _val(f, 'n-model'),
     system_prompt: _val(f, 'n-prompt'), activate: f.querySelector('.n-activate').checked}});
 }}
+function composeTemplate() {{
+  const f = document.getElementById('compose');
+  const status = document.getElementById('compose-status');
+  status.className = 'lint-result'; status.textContent = 'Generating...';
+  const payload = {{message_type: _val(f, 'c-type'), model: _val(f, 'c-model'),
+    campaign: _val(f, 'c-campaign'), specialty: _val(f, 'c-specialty'), brief: _val(f, 'c-brief')}};
+  fetch('/studio/compose', {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(payload)}}).then(r => r.ok ? r.json() : Promise.reject())
+    .then(d => {{
+      f.querySelector('.c-subject').value = d.subject;
+      f.querySelector('.c-body').value = d.body;
+      document.getElementById('compose-preview').style.display = 'block';
+      status.className = 'lint-result ' + (d.ok ? 'ok' : 'bad');
+      status.textContent = d.ok ? ('Drafted with ' + (d.model_label || d.model))
+        : ('Drafted - fix before approving: ' + d.problems.join('; '));
+    }}).catch(() => {{ status.className = 'lint-result bad'; status.textContent = 'Generate failed'; }});
+}}
+function insertComposed() {{
+  const f = document.getElementById('compose');
+  const status = document.getElementById('insert-status');
+  status.className = 'lint-result'; status.textContent = 'Inserting...';
+  const payload = {{subject: _val(f, 'c-subject'), body: _val(f, 'c-body'),
+    message_type: _val(f, 'c-type'), model: _val(f, 'c-model'), campaign: _val(f, 'c-campaign'),
+    approve: f.querySelector('.c-approve').checked}};
+  fetch('/studio/templates', {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(payload)}}).then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e)))
+    .then(() => location.reload())
+    .catch(e => {{ status.className = 'lint-result bad';
+      status.textContent = (e && e.detail) ? e.detail : 'Insert failed'; }});
+}}
 </script>
 </body></html>"""
 
@@ -377,6 +433,50 @@ def _campaigns_body(db: Session) -> str:
       (supervised / autonomous are Phase 2).</div>"""
 
 
+_MODEL_LABELS = {mid: label for label, mid in composer.MODELS}
+
+
+def _compose_panel(db: Session) -> str:
+    """The AI compose card: pick a model + message type + campaign, write a brief, generate copy."""
+    model_opts = "".join(
+        f'<option value="{html.escape(mid)}">{html.escape(label)}</option>'
+        for label, mid in composer.MODELS)
+    type_opts = "".join(
+        f'<option value="{html.escape(k)}">{html.escape(v)}</option>' for k, v in composer.MESSAGE_TYPES)
+    camps = db.execute(select(Campaign.name).order_by(Campaign.name)).scalars().all()
+    camp_opts = '<option value="">general (all campaigns)</option>' + "".join(
+        f'<option value="{html.escape(c)}">{html.escape(c)}</option>' for c in camps)
+    return f"""
+    <div class="card" id="compose">
+      <div class="section-title"><h2>Compose with AI</h2>
+        <span class="t-meta">author an outbound or follow-up message, then insert it as an A/B variant</span></div>
+      <div class="grid-2">
+        <div class="field"><label>Model</label><select class="sel c-model">{model_opts}</select></div>
+        <div class="field"><label>Message type</label><select class="sel c-type">{type_opts}</select></div>
+      </div>
+      <div class="grid-2">
+        <div class="field"><label>Campaign</label><select class="sel c-campaign">{camp_opts}</select></div>
+        <div class="field"><label>Specialty focus (optional)</label>
+          <input class="inp c-specialty" placeholder="e.g. Dermatology"></div>
+      </div>
+      <div class="field"><label>Brief</label>
+        <textarea class="ta c-brief" rows="3" placeholder="Angle / tone / what to emphasize..."></textarea></div>
+      <div class="actions">
+        <button class="btn btn-sm btn-primary" onclick="composeTemplate()">Generate</button>
+        <span id="compose-status" class="lint-result"></span>
+      </div>
+      <div id="compose-preview" style="display:none;margin-top:14px">
+        <div class="field"><label>Subject</label><input class="inp c-subject"></div>
+        <div class="field"><label>Body</label><textarea class="ta c-body" rows="9"></textarea></div>
+        <label class="check"><input type="checkbox" class="c-approve"> Approve on insert (must pass lint)</label>
+        <div class="actions">
+          <button class="btn btn-sm btn-primary" onclick="insertComposed()">Insert as variant</button>
+          <span id="insert-status" class="lint-result"></span>
+        </div>
+      </div>
+    </div>"""
+
+
 def _studio_body(db: Session) -> str:
     templates = db.execute(select(Template).order_by(Template.campaign, Template.version)).scalars().all()
     cards = []
@@ -386,6 +486,11 @@ def _studio_body(db: Session) -> str:
         status = ('<span class="pill pill-on">approved</span>' if t.is_approved
                   else '<span class="pill pill-warn">draft</span>')
         approver = f' by {html.escape(t.approved_by)}' if (t.is_approved and t.approved_by) else ""
+        mtype = composer.MESSAGE_TYPE_LABELS.get(t.message_type or "", t.message_type or "")
+        tags = f'<span class="chip-tier tier-new">{html.escape(mtype)}</span>' if mtype else ""
+        if (t.source or "") == "ai":
+            model_lbl = _MODEL_LABELS.get(t.model or "", t.model or "AI")
+            tags += f'<span class="chip-tier tier-ai">AI - {html.escape(model_lbl)}</span>'
         approve_btn = (
             f'<button class="btn btn-sm btn-primary" onclick="approveTemplate({t.id})">Approve</button>'
             if not t.is_approved else "")
@@ -398,6 +503,7 @@ def _studio_body(db: Session) -> str:
             </div>
             {status}
           </div>
+          <div class="chips">{tags}</div>
           <div class="proposed"><div class="body">{html.escape(t.body)}</div></div>
           <div class="actions">
             <button class="btn btn-sm btn-secondary" onclick="lintTemplate({t.id})">Run linter</button>
@@ -407,24 +513,38 @@ def _studio_body(db: Session) -> str:
         </div>""")
     body = "".join(cards) if cards else '<div class="empty">No templates yet.</div>'
 
+    # one label can be authored by different models across message types/campaigns (a variant spans
+    # the cadence); show the model only when it is unambiguous, else "mixed" - never a wrong single.
+    label_models: dict = {}
+    for t in templates:
+        who = (_MODEL_LABELS.get(t.model or "", t.model or "AI") if (t.source or "") == "ai" else "manual")
+        label_models.setdefault(t.variant_label or "", set()).add(who)
+
+    def _authored(label) -> str:
+        whos = label_models.get(str(label))
+        return "-" if not whos else (next(iter(whos)) if len(whos) == 1 else "mixed")
+
     perf = learning.variant_performance(db)
     winner = learning.winning_variant(db)
     perf_rows = "".join(
         f'<tr><td><div class="cell-title">{html.escape(str(r["variant"]))}'
         f'{" &#11088; winner" if r["variant"] == winner else ""}</div></td>'
+        f'<td class="t-meta">{html.escape(_authored(r["variant"]))}</td>'
         f'<td class="tabular">{r["sent"]}</td><td class="tabular">{r["replied"]}</td>'
         f'<td class="tabular">{r["activated"]}</td>'
         f'<td class="tabular">{("-" if r["activation_rate"] is None else str(r["activation_rate"]) + "%")}</td></tr>'
         for r in perf
-    ) or '<tr><td colspan="5" class="empty-cell">No variant data yet (one approved template, no A/B).</td></tr>'
+    ) or '<tr><td colspan="6" class="empty-cell">No variant data yet (one approved template, no A/B).</td></tr>'
 
     return f"""
-    <div class="section-title"><h2>Templates</h2><span class="t-meta">{len(templates)} total</span></div>
+    {_compose_panel(db)}
+    <div class="section-title" style="margin-top:22px"><h2>Templates</h2>
+      <span class="t-meta">{len(templates)} total</span></div>
     {body}
     <div class="section-title" style="margin-top:22px"><h2>Variant performance</h2>
       <span class="t-meta">A/B by activation rate{(" - winner: " + html.escape(winner)) if winner else ""}</span></div>
     <div class="card pad0"><table class="tbl">
-      <thead><tr><th>Variant</th><th>Sent</th><th>Replied</th><th>Activated</th><th>Activation rate</th></tr></thead>
+      <thead><tr><th>Variant</th><th>Authored by</th><th>Sent</th><th>Replied</th><th>Activated</th><th>Activation rate</th></tr></thead>
       <tbody>{perf_rows}</tbody></table></div>"""
 
 
@@ -943,8 +1063,46 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
     @app.get("/studio", response_class=HTMLResponse)
     def studio_page(db: Session = Depends(get_db)):
         return _shell(db, "/studio", eyebrow="Copy", title="Template studio",
-                      subtitle="Lint and approve the email templates the copywriter drafts from.",
+                      subtitle="Compose copy with AI, lint and approve it, and A/B test the variants "
+                               "the copywriter drafts from.",
                       body=_studio_body(db))
+
+    @app.post("/studio/compose")
+    def studio_compose(body: ComposeBody, db: Session = Depends(get_db)):
+        if body.message_type not in composer.MESSAGE_TYPE_KEYS:
+            raise HTTPException(status_code=400, detail="unknown message_type")
+        model = body.model or composer.DEFAULT_MODEL
+        if model not in composer.MODEL_IDS:
+            raise HTTPException(status_code=400, detail="unknown model")
+        req = composer.ComposeRequest(message_type=body.message_type, brief=body.brief,
+                                      campaign=body.campaign or None, specialty=body.specialty,
+                                      model=model)
+        try:
+            result = composer.compose_template(db, request=req, settings=settings)
+        except Exception as exc:  # a refusal or provider error must not 500 the studio
+            _LOG.warning("compose_failed", extra={"error": str(exc)})
+            raise HTTPException(status_code=502, detail="generation failed, try again or edit by hand")
+        return {"subject": result.subject, "body": result.body, "model": result.model,
+                "model_label": _MODEL_LABELS.get(result.model, result.model),
+                "message_type": result.message_type, "ok": result.ok, "problems": list(result.problems)}
+
+    @app.post("/studio/templates")
+    def studio_insert_template(request: Request, body: InsertTemplateBody, db: Session = Depends(get_db)):
+        try:
+            tpl = composer.insert_template(
+                db, campaign=body.campaign or None, subject=body.subject, body=body.body,
+                message_type=body.message_type, model=body.model, variant_label=body.variant_label,
+                created_by=_actor(request, db), approve=body.approve)
+        except ValueError as exc:
+            db.rollback()  # discard the flushed-but-non-compliant draft
+            raise HTTPException(status_code=400, detail=str(exc))
+        except IntegrityError:  # a concurrent insert took the same (campaign, version)
+            db.rollback()
+            raise HTTPException(status_code=409, detail="a version conflict occurred, please retry")
+        db.commit()
+        return {"id": tpl.id, "campaign": tpl.campaign, "version": tpl.version,
+                "variant_label": tpl.variant_label, "message_type": tpl.message_type,
+                "model": tpl.model, "is_approved": tpl.is_approved}
 
     @app.get("/analytics", response_class=HTMLResponse)
     def analytics_page(db: Session = Depends(get_db)):
