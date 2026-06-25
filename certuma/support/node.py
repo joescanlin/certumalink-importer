@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from certuma.db.models import ClinicianSignal, SupportTicket
@@ -20,7 +20,8 @@ from certuma.observability import METRICS, emit, get_logger
 from .provider import EFFECTS, SUPPORT_INTENTS
 from .stub import StubSupportClassifier
 
-__all__ = ["SupportOutcome", "SupportSummary", "handle_ticket", "run_support", "emit_sales_signal"]
+__all__ = ["SupportOutcome", "SupportSummary", "handle_ticket", "run_support", "emit_sales_signal",
+           "reclassify", "override_intent", "set_status", "bulk_set_status"]
 
 _LOG = get_logger("certuma.support")
 
@@ -58,16 +59,39 @@ def emit_sales_signal(session: Session, npi: str, signal_type: str, *, value: st
     METRICS.incr("support_signal_emitted", signal=signal_type)
 
 
-def _classify_and_handle(session: Session, ticket: SupportTicket, *, provider, when: datetime) -> SupportOutcome:
-    result = provider.classify(text=ticket.body or "", context=ticket.subject or "")
-    intent = result.intent if result.intent in SUPPORT_INTENTS else "other"
+def _retract_sales_signal(session: Session, npi: str, signal_type: str) -> None:
+    """Remove a support-derived signal once no ticket for this npi still emits it - so re-classifying
+    or overriding a ticket away from a signal-bearing intent does not leave a phantom signal that
+    sales scoring keeps reading. Guarded: a signal another ticket still asserts is left in place."""
+    still = session.execute(
+        select(SupportTicket.id).where(
+            SupportTicket.npi == npi, SupportTicket.emitted_signal == signal_type).limit(1)
+    ).first()
+    if still is None:
+        session.execute(delete(ClinicianSignal).where(
+            ClinicianSignal.npi == npi, ClinicianSignal.signal_type == signal_type,
+            ClinicianSignal.source == "support"))
+        METRICS.incr("support_signal_retracted", signal=signal_type)
+
+
+def _apply_effects(session: Session, ticket: SupportTicket, intent: str, *, when: datetime) -> SupportOutcome:
+    """Apply an intent's canonical effects to a ticket (status, auto-answer, sales signal). Shared by
+    the autonomous classifier and the operator's re-classify / override-intent actions."""
+    old_signal = ticket.emitted_signal
     status, signal, answer = EFFECTS[intent]
     ticket.intent = intent
     ticket.status = status
     ticket.answer = answer
     ticket.emitted_signal = signal
+    # preserve an existing resolution time; only stamp one when newly resolved, clear it when re-opened
     if status in ("answered", "resolved"):
-        ticket.resolved_at = when
+        if ticket.resolved_at is None:
+            ticket.resolved_at = when
+    else:
+        ticket.resolved_at = None
+    session.flush()  # persist the new emitted_signal before reconciling the prior one
+    if old_signal and old_signal != signal and ticket.npi:
+        _retract_sales_signal(session, ticket.npi, old_signal)
     if signal and ticket.npi:
         emit_sales_signal(session, ticket.npi, signal, value=intent, when=when)
     session.flush()
@@ -75,6 +99,68 @@ def _classify_and_handle(session: Session, ticket: SupportTicket, *, provider, w
     emit(_LOG, "support_handled", ticket_id=ticket.id, npi=ticket.npi, intent=intent,
          status=status, sales_signal=signal)
     return SupportOutcome(intent=intent, status=status, sales_signal=signal, escalated=(status == "escalated"))
+
+
+def _classify_and_handle(session: Session, ticket: SupportTicket, *, provider, when: datetime) -> SupportOutcome:
+    result = provider.classify(text=ticket.body or "", context=ticket.subject or "")
+    intent = result.intent if result.intent in SUPPORT_INTENTS else "other"
+    return _apply_effects(session, ticket, intent, when=when)
+
+
+def _get_ticket(session: Session, ticket_id: int) -> SupportTicket:
+    ticket = session.get(SupportTicket, ticket_id)
+    if ticket is None:
+        raise KeyError(ticket_id)
+    return ticket
+
+
+def reclassify(session: Session, ticket_id: int, *, provider=None,
+               when: Optional[datetime] = None) -> Tuple[SupportTicket, SupportOutcome]:
+    """Re-run the classifier on an existing ticket (e.g. after editing it). Caller commits."""
+    provider = provider or StubSupportClassifier()
+    when = when or datetime.now(timezone.utc)
+    ticket = _get_ticket(session, ticket_id)
+    outcome = _classify_and_handle(session, ticket, provider=provider, when=when)
+    return ticket, outcome
+
+
+def override_intent(session: Session, ticket_id: int, intent: str, *,
+                    when: Optional[datetime] = None) -> Tuple[SupportTicket, SupportOutcome]:
+    """An operator forces a specific intent; its canonical effects (status, signal) are re-applied."""
+    if intent not in SUPPORT_INTENTS:
+        raise ValueError(f"unknown intent {intent!r}")
+    when = when or datetime.now(timezone.utc)
+    ticket = _get_ticket(session, ticket_id)
+    outcome = _apply_effects(session, ticket, intent, when=when)
+    return ticket, outcome
+
+
+def set_status(session: Session, ticket_id: int, status: str, *,
+               when: Optional[datetime] = None) -> SupportTicket:
+    """Mark a ticket resolved / escalated / answered / open without re-classifying it."""
+    if status not in ("open", "answered", "escalated", "resolved"):
+        raise ValueError(f"unknown status {status!r}")
+    when = when or datetime.now(timezone.utc)
+    ticket = _get_ticket(session, ticket_id)
+    ticket.status = status
+    ticket.resolved_at = when if status in ("answered", "resolved") else None
+    session.flush()
+    METRICS.incr("support_status_set", status=status)
+    emit(_LOG, "support_status_set", ticket_id=ticket_id, status=status)
+    return ticket
+
+
+def bulk_set_status(session: Session, ticket_ids, status: str, *,
+                    when: Optional[datetime] = None) -> int:
+    """Apply a status to several tickets at once (the list-view bulk action). Returns the count."""
+    count = 0
+    for tid in ticket_ids:
+        try:
+            set_status(session, int(tid), status, when=when)
+            count += 1
+        except (KeyError, ValueError):
+            continue
+    return count
 
 
 def handle_ticket(session: Session, *, npi: Optional[str], body: str, subject: str = "",

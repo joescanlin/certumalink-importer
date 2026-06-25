@@ -691,3 +691,15 @@ strong {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
 }
+
+/* ---- drill-in rows + bulk actions ---- */
+a.rowlink { color: var(--accent); text-decoration: none; }
+a.rowlink:hover { text-decoration: underline; }
+.bulkbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 4px 0 12px;
+}
+.selcell { width: 34px; text-align: center; }

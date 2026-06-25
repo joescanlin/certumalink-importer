@@ -229,6 +229,116 @@ class SupportTests(unittest.TestCase):
         self.assertIn(churn, order)
         self.assertLess(order.index(churn), order.index(hi))  # churn floats above the high-fit lead
 
+    def test_set_status_resolve_then_escalate(self):
+        self._prospect("2700000020")
+        ticket, _ = support.handle_ticket(self.session, npi="2700000020", body="how do i edit?", when=WHEN)
+        support.set_status(self.session, ticket.id, "resolved", when=WHEN)
+        self.assertEqual(ticket.status, "resolved")
+        self.assertIsNotNone(ticket.resolved_at)
+        support.set_status(self.session, ticket.id, "escalated", when=WHEN)
+        self.assertEqual(ticket.status, "escalated")
+        self.assertIsNone(ticket.resolved_at)  # escalation clears the resolved timestamp
+
+    def test_set_status_validates_and_404s(self):
+        with self.assertRaises(KeyError):
+            support.set_status(self.session, 99999999, "resolved", when=WHEN)
+        self._prospect("2700000024")
+        ticket, _ = support.handle_ticket(self.session, npi="2700000024", body="x", when=WHEN)
+        with self.assertRaises(ValueError):
+            support.set_status(self.session, ticket.id, "bogus", when=WHEN)
+
+    def test_override_intent_reapplies_effects_and_emits_signal(self):
+        self._prospect("2700000021")
+        ticket, _ = support.handle_ticket(self.session, npi="2700000021", body="how do i edit?", when=WHEN)
+        self.assertIsNone(self._signal("2700000021", EXPANSION_INTENT))  # how_to emits nothing
+        support.override_intent(self.session, ticket.id, "expansion_interest", when=WHEN)
+        self.assertEqual(ticket.intent, "expansion_interest")
+        self.assertEqual(ticket.emitted_signal, EXPANSION_INTENT)
+        self.assertIsNotNone(self._signal("2700000021", EXPANSION_INTENT))  # now an upsell signal
+        with self.assertRaises(ValueError):
+            support.override_intent(self.session, ticket.id, "not_an_intent", when=WHEN)
+
+    def test_reclassify_reruns_the_classifier(self):
+        self._prospect("2700000023")
+        ticket, _ = support.handle_ticket(self.session, npi="2700000023", body="just a note", when=WHEN)
+        ticket.body = "I am frustrated and want to cancel."  # operator edited it
+        self.session.flush()
+        support.reclassify(self.session, ticket.id, when=WHEN)
+        self.assertEqual(ticket.intent, "complaint")
+        self.assertEqual(ticket.status, "escalated")
+        self.assertIsNotNone(self._signal("2700000023", CHURN_RISK))
+
+    def test_override_away_from_a_signal_retracts_it(self):
+        # the load-bearing fix: correcting a misclassification must not leave a phantom sales signal
+        self._prospect("2700000041")
+        t, _ = support.handle_ticket(self.session, npi="2700000041",
+                                     body="We want to add more seats.", when=WHEN)
+        self.assertIsNotNone(self._signal("2700000041", EXPANSION_INTENT))
+        support.override_intent(self.session, t.id, "how_to", when=WHEN)
+        self.assertIsNone(t.emitted_signal)
+        self.assertIsNone(self._signal("2700000041", EXPANSION_INTENT))  # no phantom upsell left behind
+
+    def test_override_between_signals_drops_the_old(self):
+        self._prospect("2700000042")
+        t, _ = support.handle_ticket(self.session, npi="2700000042",
+                                     body="We want to add more seats.", when=WHEN)
+        support.override_intent(self.session, t.id, "complaint", when=WHEN)
+        self.assertIsNone(self._signal("2700000042", EXPANSION_INTENT))   # upsell retracted
+        self.assertIsNotNone(self._signal("2700000042", CHURN_RISK))      # churn now present
+
+    def test_retract_keeps_a_signal_another_ticket_still_emits(self):
+        # two tickets assert the same signal; retracting one must NOT remove the shared signal
+        self._prospect("2700000040")
+        t1, _ = support.handle_ticket(self.session, npi="2700000040",
+                                      body="We want to add more seats.", when=WHEN)
+        t2, _ = support.handle_ticket(self.session, npi="2700000040",
+                                      body="please add more seats for our group", when=WHEN)
+        self.assertIsNotNone(self._signal("2700000040", EXPANSION_INTENT))
+        support.override_intent(self.session, t1.id, "how_to", when=WHEN)
+        self.assertIsNotNone(self._signal("2700000040", EXPANSION_INTENT))  # t2 still asserts it
+        support.override_intent(self.session, t2.id, "how_to", when=WHEN)
+        self.assertIsNone(self._signal("2700000040", EXPANSION_INTENT))     # now nobody does
+
+    def test_override_to_same_intent_is_idempotent(self):
+        self._prospect("2700000043")
+        t, _ = support.handle_ticket(self.session, npi="2700000043",
+                                     body="We want to add more seats.", when=WHEN)
+        support.override_intent(self.session, t.id, "expansion_interest", when=WHEN)
+        n = self.session.execute(select(func.count()).select_from(ClinicianSignal).where(
+            ClinicianSignal.npi == "2700000043", ClinicianSignal.signal_type == EXPANSION_INTENT,
+            ClinicianSignal.source == "support")).scalar()
+        self.assertEqual(n, 1)
+        self.assertEqual(t.emitted_signal, EXPANSION_INTENT)
+
+    def test_reclassify_to_a_non_signal_intent_retracts(self):
+        self._prospect("2700000044")
+        t, _ = support.handle_ticket(self.session, npi="2700000044",
+                                     body="We want to add more seats.", when=WHEN)
+        self.assertIsNotNone(self._signal("2700000044", EXPANSION_INTENT))
+        t.body = "how do i edit my listing?"  # operator corrected the message
+        self.session.flush()
+        support.reclassify(self.session, t.id, when=WHEN)
+        self.assertEqual(t.intent, "how_to")
+        self.assertIsNone(self._signal("2700000044", EXPANSION_INTENT))
+
+    def test_override_preserves_an_existing_resolution_time(self):
+        self._prospect("2700000045")
+        t, _ = support.handle_ticket(self.session, npi="2700000045", body="how do i edit?", when=WHEN)
+        first_resolved = t.resolved_at
+        self.assertIsNotNone(first_resolved)
+        support.override_intent(self.session, t.id, "billing", when=WHEN + timedelta(days=2))
+        self.assertEqual(t.resolved_at, first_resolved)  # not bumped to the override time
+
+    def test_bulk_set_status_skips_unknown_ids(self):
+        ids = []
+        for i in range(3):
+            npi = f"270000003{i}"
+            self._prospect(npi)
+            t, _ = support.handle_ticket(self.session, npi=npi, body="how do i edit?", when=WHEN)
+            ids.append(t.id)
+        n = support.bulk_set_status(self.session, ids + [99999999], "resolved", when=WHEN)
+        self.assertEqual(n, 3)  # the bogus id is skipped, not an error
+
     def test_signal_without_npi_is_not_emitted(self):
         # an anonymous portal ticket still classifies but cannot attach a sales signal
         _ticket, outcome = support.handle_ticket(

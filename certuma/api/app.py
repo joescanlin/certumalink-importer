@@ -17,7 +17,7 @@ import html
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -157,6 +157,16 @@ class AgentCreateBody(BaseModel):
 
 class TerminalBody(BaseModel):
     command: str = Field(..., max_length=200)
+
+
+class SupportActionBody(BaseModel):
+    action: str
+    intent: Optional[str] = None
+
+
+class SupportBulkBody(BaseModel):
+    ids: List[int] = Field(..., max_length=500)
+    action: str
 
 
 class AgentUpdateBody(BaseModel):
@@ -364,6 +374,25 @@ async function runTerminal() {{
   }}
   inp.disabled = false; inp.focus();
 }}
+function ticketAction(id, action) {{ _post('/support/' + id + '/action', {{action: action}}); }}
+function ticketOverride(id) {{
+  const sel = document.getElementById('ovr-' + id);
+  _post('/support/' + id + '/action', {{action: 'override', intent: sel.value}});
+}}
+function supSel() {{
+  const n = document.querySelectorAll('.t-sel:checked').length;
+  const el = document.getElementById('sel-count'); if (el) el.textContent = n;
+}}
+function supSelAll() {{
+  const all = document.getElementById('t-all').checked;
+  document.querySelectorAll('.t-sel').forEach(c => {{ c.checked = all; }});
+  supSel();
+}}
+async function bulkSupport(action) {{
+  const ids = Array.from(document.querySelectorAll('.t-sel:checked')).map(c => parseInt(c.value, 10));
+  if (!ids.length) {{ alert('Select at least one ticket'); return; }}
+  await _post('/support/bulk', {{ids: ids, action: action}});
+}}
 </script>
 </body></html>"""
 
@@ -440,7 +469,7 @@ def _campaigns_body(db: Session) -> str:
         nm = html.escape(c.name)
         rows.append(f"""
         <tr>
-          <td><div class="cell-title">{html.escape(c.label or c.name)}</div>
+          <td><a class="cell-title rowlink" href="/campaigns/{nm}">{html.escape(c.label or c.name)}</a>
               <div class="t-meta">{nm}</div></td>
           <td>{active_pill}</td>
           <td>{paused_pill}</td>
@@ -464,6 +493,86 @@ def _campaigns_body(db: Session) -> str:
     </div>
     <div class="t-meta" style="margin-top:12px">Autonomy: assisted = every send human-approved
       (supervised / autonomous are Phase 2).</div>"""
+
+
+def _campaign_detail_body(db: Session, name: str) -> str:
+    c = db.get(Campaign, name)
+    if c is None:
+        return ('<div class="empty">That campaign does not exist. '
+                '<a href="/campaigns">Back to campaigns</a>.</div>')
+    nm = html.escape(name)
+    active_pill = ('<span class="pill pill-on">active</span>' if c.is_active
+                   else '<span class="pill pill-off">inactive</span>')
+    paused_pill = ('<span class="pill pill-warn">paused</span>' if c.is_paused
+                   else '<span class="pill pill-on">running</span>')
+    opts = "".join(
+        f'<option value="{lvl}"{" selected" if c.autonomy_level == lvl else ""}>{lvl}</option>'
+        for lvl in _AUTONOMY_LEVELS)
+
+    status_counts = db.execute(
+        select(Lead.activation_status, func.count()).where(Lead.campaign == name)
+        .group_by(Lead.activation_status).order_by(func.count().desc())).all()
+    total = sum(n for _, n in status_counts)
+    funnel_rows = "".join(
+        f'<tr><td><div class="cell-title">{html.escape(st)}</div></td>'
+        f'<td class="tabular">{n}</td></tr>' for st, n in status_counts
+    ) or '<tr><td colspan="2" class="empty-cell">No leads in this campaign yet.</td></tr>'
+
+    templates = db.execute(
+        select(Template).where(Template.campaign == name).order_by(Template.version)).scalars().all()
+    _trs = []
+    for t in templates:
+        sub = f" - {html.escape(t.variant_label)}" if t.variant_label else ""
+        mt = (f" - {html.escape(composer.MESSAGE_TYPE_LABELS.get(t.message_type, t.message_type))}"
+              if t.message_type else "")
+        state = ('<span class="pill pill-on">approved</span>' if t.is_approved
+                 else '<span class="pill pill-warn">draft</span>')
+        who = (_MODEL_LABELS.get(t.model or "", t.model or "") if (t.source or "") == "ai" else "manual")
+        _trs.append(
+            f'<tr><td><div class="cell-title">{html.escape(t.subject)}</div>'
+            f'<div class="t-meta">v{t.version}{sub}{mt}</div></td>'
+            f'<td>{state}</td><td class="t-meta">{html.escape(who)}</td></tr>')
+    tmpl_rows = "".join(_trs) or '<tr><td colspan="3" class="empty-cell">No templates for this campaign.</td></tr>'
+
+    msgs = db.execute(
+        select(Message, Prospect).join(Prospect, Message.npi == Prospect.npi, isouter=True)
+        .where(Message.campaign == name).order_by(Message.id.desc()).limit(10)).all()
+    msg_rows = "".join(
+        f'<tr><td><div class="cell-title">{html.escape((p.display_name if p else None) or (m.npi or ""))}</div></td>'
+        f'<td class="t-meta">{html.escape(m.direction or "")} {html.escape(m.channel or "")}</td>'
+        f'<td class="t-meta">{html.escape((m.subject or m.body_rendered or "")[:60])}</td></tr>'
+        for m, p in msgs
+    ) or '<tr><td colspan="3" class="empty-cell">No messages yet.</td></tr>'
+
+    return f"""
+    <div class="head-row" style="margin-bottom:14px">
+      <a class="t-meta" href="/campaigns">&larr; Back to campaigns</a></div>
+    <div class="card">
+      <div class="card-head">
+        <div class="who"><div class="name">{html.escape(c.label or c.name)}</div>
+          <div class="sub">{nm} - {total} leads</div></div>
+        {active_pill}{paused_pill}
+      </div>
+      <div class="field"><label>Autonomy</label>
+        <select class="sel" onchange="campaignSet('{nm}','autonomy_level',this.value)">{opts}</select></div>
+      <div class="actions">
+        <button class="btn btn-sm btn-secondary" onclick="campaignSet('{nm}','is_active',{str(not c.is_active).lower()})">
+          {"Deactivate" if c.is_active else "Activate"}</button>
+        <button class="btn btn-sm btn-secondary" onclick="campaignSet('{nm}','is_paused',{str(not c.is_paused).lower()})">
+          {"Resume sending" if c.is_paused else "Pause sending"}</button>
+      </div>
+    </div>
+    <div class="section-title" style="margin-top:22px"><h2>Lead funnel</h2></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>Status</th><th>Leads</th></tr></thead><tbody>{funnel_rows}</tbody></table></div>
+    <div class="section-title" style="margin-top:22px"><h2>Templates</h2></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>Template</th><th>State</th><th>Authored by</th></tr></thead>
+      <tbody>{tmpl_rows}</tbody></table></div>
+    <div class="section-title" style="margin-top:22px"><h2>Recent activity</h2></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>Clinician</th><th>Touch</th><th>Subject</th></tr></thead>
+      <tbody>{msg_rows}</tbody></table></div>"""
 
 
 _MODEL_LABELS = {mid: label for label, mid in composer.MODELS}
@@ -842,12 +951,14 @@ def _support_body(db: Session) -> str:
         resolution = (html.escape(t.answer) if t.answer else
                       ("escalated to a human" if t.status == "escalated" else ""))
         trows.append(
-            f'<tr><td><div class="cell-title">{html.escape(name)}</div>'
+            f'<tr><td class="selcell"><input type="checkbox" class="t-sel" value="{t.id}" '
+            f'onclick="supSel()"></td>'
+            f'<td><a class="cell-title rowlink" href="/support/{t.id}">{html.escape(name)}</a>'
             f'<div class="t-meta">{html.escape(t.body or "")[:90]}</div></td>'
             f'<td><span class="chip-tier tier-ai">{html.escape(intent)}</span></td>'
             f'<td><span class="pill {status_pill}">{html.escape(t.status)}</span></td>'
             f'<td class="t-meta">{resolution}</td></tr>')
-    ticket_rows = "".join(trows) or '<tr><td colspan="4" class="empty-cell">No support tickets yet.</td></tr>'
+    ticket_rows = "".join(trows) or '<tr><td colspan="5" class="empty-cell">No support tickets yet.</td></tr>'
 
     sigs = db.execute(
         select(ClinicianSignal, Prospect)
@@ -868,15 +979,100 @@ def _support_body(db: Session) -> str:
 
     return f"""
     <div class="section-title"><h2>Support tickets</h2>
-      <span class="t-meta">classified, answered or escalated by the support agents</span></div>
+      <span class="t-meta">click a clinician to open the ticket; select rows for a bulk action</span></div>
+    <div class="bulkbar">
+      <label class="check"><input type="checkbox" id="t-all" onclick="supSelAll()"> select all</label>
+      <span class="t-meta"><span id="sel-count">0</span> selected</span>
+      <button class="btn btn-sm btn-secondary" onclick="bulkSupport('resolved')">Resolve selected</button>
+      <button class="btn btn-sm btn-secondary" onclick="bulkSupport('escalated')">Escalate selected</button>
+    </div>
     <div class="card pad0"><table class="tbl">
-      <thead><tr><th>Clinician</th><th>Intent</th><th>Status</th><th>Resolution</th></tr></thead>
+      <thead><tr><th></th><th>Clinician</th><th>Intent</th><th>Status</th><th>Resolution</th></tr></thead>
       <tbody>{ticket_rows}</tbody></table></div>
     <div class="section-title" style="margin-top:24px"><h2>Sales signals from support</h2>
       <span class="t-meta">support interactions feeding the sales knowledge graph</span></div>
     <div class="card pad0"><table class="tbl">
       <thead><tr><th>Clinician</th><th>Signal</th><th>Source</th></tr></thead>
       <tbody>{signal_rows}</tbody></table></div>"""
+
+
+def _support_detail_body(db: Session, ticket_id: int) -> str:
+    row = db.execute(
+        select(SupportTicket, Prospect)
+        .join(Prospect, SupportTicket.npi == Prospect.npi, isouter=True)
+        .where(SupportTicket.id == ticket_id)
+    ).first()
+    if row is None:
+        return '<div class="empty">That support ticket does not exist. <a href="/support">Back to support</a>.</div>'
+    t, p = row
+    name = (p.display_name if p else None) or (t.npi or "unknown")
+    meta = " - ".join(x for x in ((p.primary_specialty if p else ""), (t.npi or "")) if x)
+    status_pill = _SUPPORT_STATUS_PILL.get(t.status, "pill-off")
+    intent = (t.intent or "unclassified").replace("_", " ")
+    created = t.created_at.strftime("%Y-%m-%d %H:%M UTC") if t.created_at else ""
+    answer = (f'<div class="proposed"><div class="subj">Agent answer</div>'
+              f'<div class="body">{html.escape(t.answer)}</div></div>' if t.answer else "")
+    escalated_note = ('<div class="t-meta" style="margin-top:8px">This ticket is escalated to a human.</div>'
+                      if t.status == "escalated" else "")
+
+    sig = None
+    if t.npi:
+        sig = db.execute(select(ClinicianSignal).where(
+            ClinicianSignal.npi == t.npi, ClinicianSignal.source == "support",
+            ClinicianSignal.signal_type == (t.emitted_signal or "")).limit(1)).scalar() if t.emitted_signal else None
+    if sig is not None:
+        label = _SUPPORT_SIGNAL_LABEL.get(sig.signal_type, sig.signal_type)
+        pill = _SUPPORT_SIGNAL_PILL.get(sig.signal_type, "tier-new")
+        signal_card = (f'<div class="card"><div class="section-title"><h2>Sales signal</h2></div>'
+                       f'<span class="chip-tier {pill}">{html.escape(label)}</span>'
+                       f'<div class="t-meta" style="margin-top:8px">written to the knowledge graph that '
+                       f'sales scoring reads (source: support)</div></div>')
+    else:
+        signal_card = ('<div class="card"><div class="section-title"><h2>Sales signal</h2></div>'
+                       '<div class="t-meta">no sales signal from this ticket</div></div>')
+
+    others = db.execute(
+        select(SupportTicket).where(SupportTicket.npi == t.npi, SupportTicket.id != t.id)
+        .order_by(SupportTicket.id.desc()).limit(8)) if t.npi else None
+    other_rows = "".join(
+        f'<tr><td><a class="rowlink" href="/support/{o.id}">{html.escape((o.subject or o.body or "")[:60])}</a></td>'
+        f'<td><span class="pill {_SUPPORT_STATUS_PILL.get(o.status, "pill-off")}">{html.escape(o.status)}</span></td></tr>'
+        for o in (others.scalars().all() if others is not None else [])
+    ) or '<tr><td colspan="2" class="empty-cell">No other tickets from this clinician.</td></tr>'
+
+    intent_opts = "".join(
+        f'<option value="{i}"{" selected" if i == t.intent else ""}>{html.escape(i.replace("_", " "))}</option>'
+        for i in support.SUPPORT_INTENTS)
+
+    return f"""
+    <div class="head-row" style="margin-bottom:14px">
+      <a class="t-meta" href="/support">&larr; Back to support</a></div>
+    <div class="card">
+      <div class="card-head">
+        <div class="who"><div class="name">{html.escape(name)}</div>
+          <div class="sub">{html.escape(meta)} - {html.escape(t.channel or "portal")} - {html.escape(created)}</div></div>
+        <span class="pill {status_pill}">{html.escape(t.status)}</span>
+      </div>
+      <div class="chips"><span class="chip-tier tier-ai">{html.escape(intent)}</span></div>
+      <div class="proposed"><div class="subj">{html.escape(t.subject or "(no subject)")}</div>
+        <div class="body">{html.escape(t.body or "")}</div></div>
+      {answer}{escalated_note}
+      <div class="actions" style="margin-top:12px;flex-wrap:wrap">
+        <button class="btn btn-sm btn-secondary" onclick="ticketAction({t.id},'reclassify')">Re-classify</button>
+        <button class="btn btn-sm btn-secondary" onclick="ticketAction({t.id},'escalate')">Escalate</button>
+        <button class="btn btn-sm btn-primary" onclick="ticketAction({t.id},'resolve')">Resolve</button>
+      </div>
+      <div class="field" style="margin-top:12px"><label>Override intent</label>
+        <div class="actions">
+          <select class="sel" id="ovr-{t.id}">{intent_opts}</select>
+          <button class="btn btn-sm btn-secondary" onclick="ticketOverride({t.id})">Apply intent</button>
+        </div>
+      </div>
+    </div>
+    {signal_card}
+    <div class="section-title" style="margin-top:22px"><h2>Other tickets from this clinician</h2></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>Ticket</th><th>Status</th></tr></thead><tbody>{other_rows}</tbody></table></div>"""
 
 
 def _dim_table(title: str, rows: list) -> str:
@@ -1107,6 +1303,43 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
         return {"ticket_id": ticket.id, "intent": outcome.intent, "status": outcome.status,
                 "sales_signal": outcome.sales_signal}
 
+    @app.post("/support/bulk")
+    def support_bulk(body: SupportBulkBody, db: Session = Depends(get_db)):
+        if body.action not in ("resolved", "escalated"):
+            raise HTTPException(status_code=400, detail="unknown bulk action")
+        count = support.bulk_set_status(db, body.ids, body.action)
+        db.commit()
+        return {"ok": True, "updated": count}
+
+    @app.get("/support/{ticket_id}", response_class=HTMLResponse)
+    def support_detail_page(ticket_id: int, db: Session = Depends(get_db)):
+        return _shell(db, "/support", eyebrow="Customer success", title="Support ticket",
+                      subtitle="The full ticket, the sales signal it produced, and the actions you can take.",
+                      body=_support_detail_body(db, ticket_id))
+
+    @app.post("/support/{ticket_id}/action")
+    def support_ticket_action(ticket_id: int, body: SupportActionBody, db: Session = Depends(get_db)):
+        try:
+            if body.action == "reclassify":
+                support.reclassify(db, ticket_id)
+            elif body.action == "resolve":
+                support.set_status(db, ticket_id, "resolved")
+            elif body.action == "escalate":
+                support.set_status(db, ticket_id, "escalated")
+            elif body.action == "override":
+                if not body.intent:
+                    raise HTTPException(status_code=400, detail="intent is required to override")
+                support.override_intent(db, ticket_id, body.intent)
+            else:
+                raise HTTPException(status_code=400, detail="unknown action")
+        except KeyError:
+            raise HTTPException(status_code=404, detail="ticket not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        db.commit()
+        ticket = db.get(SupportTicket, ticket_id)
+        return {"ok": True, "ticket_id": ticket_id, "intent": ticket.intent, "status": ticket.status}
+
     @app.get("/escalations", response_class=HTMLResponse)
     def escalations_page(db: Session = Depends(get_db)):
         return _shell(db, "/escalations", eyebrow="Human in the loop", title="Escalations",
@@ -1119,6 +1352,12 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
         return _shell(db, "/campaigns", eyebrow="Configuration", title="Campaigns",
                       subtitle="Activate, pause, and set the autonomy level for each outreach campaign.",
                       body=_campaigns_body(db))
+
+    @app.get("/campaigns/{name}", response_class=HTMLResponse)
+    def campaign_detail_page(name: str, db: Session = Depends(get_db)):
+        return _shell(db, "/campaigns", eyebrow="Configuration", title="Campaign",
+                      subtitle="Configuration, lead funnel, templates, and recent activity for this campaign.",
+                      body=_campaign_detail_body(db, name))
 
     @app.get("/studio", response_class=HTMLResponse)
     def studio_page(db: Session = Depends(get_db)):
