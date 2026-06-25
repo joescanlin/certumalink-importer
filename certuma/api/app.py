@@ -24,11 +24,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import Session
 
-from certuma import (agents, auth, composer, engagement, gate, inbound, intelligence, learning,
-                     monitor, orchestrator, reporting, support, webterm)
+from certuma import (agents, auth, composer, docimport, engagement, gate, inbound, intelligence,
+                     learning, monitor, orchestrator, reporting, support, webterm)
 from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
 from certuma.observability import get_logger
@@ -157,6 +157,11 @@ class AgentCreateBody(BaseModel):
 
 class TerminalBody(BaseModel):
     command: str = Field(..., max_length=200)
+
+
+class DocImportBody(BaseModel):
+    rel: str = Field(..., max_length=300)
+    campaign: Optional[str] = None
 
 
 class SupportActionBody(BaseModel):
@@ -368,11 +373,68 @@ async function runTerminal() {{
     if (d.output) _termAppend('<pre class="term-pre">' + _termEsc(d.output) + '</pre>');
     const code = (d.exit_code === null || d.exit_code === undefined) ? '' : (' (exit ' + d.exit_code + ')');
     _termAppend('<div class="term-line ' + (d.ok ? 't-ok' : 'term-err') + '">' + (d.ok ? 'done' : 'failed') + code + '</div>');
+    if (d.ok) loadDocuments();  // a run may have produced new documents
   }} catch (e) {{
     const run = document.getElementById('term-running'); if (run) run.remove();
     _termAppend('<div class="term-line term-err">request failed</div>');
   }}
   inp.disabled = false; inp.focus();
+}}
+function _attr(s) {{ return _termEsc(s).replace(/"/g, '&quot;'); }}
+function loadDocuments() {{
+  const el = document.getElementById('docs');
+  if (!el) return;
+  fetch('/terminal/documents').then(r => r.json()).then(d => {{
+    if (!d.runs || !d.runs.length) {{
+      el.innerHTML = '<div class="t-meta">No documents yet. Run <code>certumalink_run --zip 78701</code>'
+        + ' (add <code>--fixture</code> for the offline sample).</div>';
+      return;
+    }}
+    let h = '';
+    d.runs.forEach(run => {{
+      h += '<div class="card pad0" style="margin-bottom:12px"><div class="doc-run">' + _termEsc(run.run) + '</div>';
+      h += '<table class="tbl"><thead><tr><th>Document</th><th>Rows</th><th>Size</th><th></th></tr></thead><tbody>';
+      run.files.forEach(f => {{
+        const imp = f.importable
+          ? '<button class="btn btn-sm btn-secondary" data-import="' + _attr(f.rel) + '">Import</button>' : '';
+        h += '<tr><td><a class="rowlink" href="#" data-view="' + _attr(f.rel) + '">'
+          + _termEsc(f.name) + '</a></td><td class="t-meta">' + (f.rows === null ? '-' : f.rows)
+          + '</td><td class="t-meta">' + f.size + ' B</td><td>' + imp + '</td></tr>';
+      }});
+      h += '</tbody></table></div>';
+    }});
+    el.innerHTML = h;
+  }}).catch(() => {{}});
+}}
+function viewDocument(rel) {{
+  fetch('/terminal/documents/view?rel=' + encodeURIComponent(rel)).then(r => r.json()).then(d => {{
+    const el = document.getElementById('doc-preview');
+    let h = '<div class="card"><div class="section-title"><h2>' + _termEsc(d.name) + '</h2></div>';
+    if (d.kind === 'csv') {{
+      h += '<div style="overflow:auto"><table class="tbl"><thead><tr>';
+      d.header.forEach(c => h += '<th>' + _termEsc(c) + '</th>');
+      h += '</tr></thead><tbody>';
+      d.rows.forEach(row => {{ h += '<tr>'; row.forEach(c => h += '<td class="t-meta">' + _termEsc(c) + '</td>'); h += '</tr>'; }});
+      h += '</tbody></table></div>';
+      if (d.truncated) h += '<div class="t-meta" style="margin-top:8px">showing the first ' + d.rows.length + ' of ' + d.total_rows + ' rows</div>';
+    }} else {{
+      h += '<pre class="term-pre" style="background:#1c1a18;padding:12px;border-radius:10px;margin-top:8px">' + _termEsc(d.text) + '</pre>';
+    }}
+    h += '</div>';
+    el.innerHTML = h;
+    el.scrollIntoView({{behavior: 'smooth', block: 'nearest'}});
+  }}).catch(() => {{ alert('Could not open that document'); }});
+}}
+function importDocument(rel) {{
+  const v = document.getElementById('doc-campaign').value;
+  const payload = {{rel: rel}};
+  if (v !== '__none__') payload.campaign = v;
+  fetch('/terminal/documents/import', {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(payload)}}).then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e)))
+    .then(d => {{ alert('Imported ' + d.created + ' new, ' + d.updated + ' updated'
+      + (d.leads_created ? (', ' + d.leads_created + ' leads') : '')
+      + (d.skipped ? (', ' + d.skipped + ' skipped') : '') + '.'); }})
+    .catch(e => {{ alert((e && e.detail) ? e.detail : 'Import failed'); }});
 }}
 function ticketAction(id, action) {{ _post('/support/' + id + '/action', {{action: action}}); }}
 function ticketOverride(id) {{
@@ -393,6 +455,17 @@ async function bulkSupport(action) {{
   if (!ids.length) {{ alert('Select at least one ticket'); return; }}
   await _post('/support/bulk', {{ids: ids, action: action}});
 }}
+(function () {{
+  const docsEl = document.getElementById('docs');
+  if (!docsEl) return;  // only on the terminal page
+  docsEl.addEventListener('click', function (e) {{
+    const v = e.target.closest('[data-view]');
+    if (v) {{ e.preventDefault(); viewDocument(v.getAttribute('data-view')); return; }}
+    const im = e.target.closest('[data-import]');
+    if (im) {{ importDocument(im.getAttribute('data-import')); }}
+  }});
+  loadDocuments();  // surface documents from earlier runs on load
+}})();
 </script>
 </body></html>"""
 
@@ -839,27 +912,42 @@ def _agents_body(db: Session) -> str:
     {new_form}"""
 
 
+_TERM_EXAMPLES = {"certumalink_run": "certumalink_run --zip 78701"}
+
+
 def _terminal_body(db: Session) -> str:
     palette = "".join(
-        f'<button class="btn btn-sm btn-secondary" onclick="termFill(\'{html.escape(c.key)}\')">'
+        f'<button class="btn btn-sm btn-secondary" '
+        f'onclick="termFill(\'{html.escape(_TERM_EXAMPLES.get(c.key, c.key))}\')">'
         f'{html.escape(c.label)}</button>' for c in webterm.COMMANDS.values())
     cmd_rows = "".join(
         f'<tr><td><code>{html.escape(c.key)}</code></td>'
         f'<td class="t-meta">{html.escape(c.description)}</td></tr>'
         for c in webterm.COMMANDS.values())
+    camps = db.execute(select(Campaign.name).order_by(Campaign.name)).scalars().all()
+    camp_opts = ('<option value="__none__">prospects only</option>' + "".join(
+        f'<option value="{html.escape(c)}"{" selected" if c == "primary-care" else ""}>'
+        f'{html.escape(c)}</option>' for c in camps if c))
     return f"""
     <div class="section-title"><h2>Console</h2>
-      <span class="t-meta">run the platform's data tools; this is an allowlist, not a shell</span></div>
+      <span class="t-meta">run the real CLI data tools; this is an allowlist, not a shell</span></div>
     <div class="term" id="term">
-      <div class="term-out" id="term-out"><div class="term-line t-dim">Type a command, or `help`. Try `import-demo` or `seed-active`.</div></div>
+      <div class="term-out" id="term-out"><div class="term-line t-dim">Type a command, or `help`. Try `certumalink_run --zip 78701` or `seed-active`.</div></div>
       <div class="term-input">
         <span class="term-prompt">certuma&gt;</span>
         <input class="term-cmd" id="term-cmd" autocomplete="off" spellcheck="false"
-               placeholder="help" onkeydown="if(event.key==='Enter')runTerminal()">
+               placeholder="certumalink_run --zip 78701" onkeydown="if(event.key==='Enter')runTerminal()">
         <button class="btn btn-sm btn-primary" onclick="runTerminal()">Run</button>
       </div>
     </div>
     <div class="term-palette">{palette}</div>
+    <div class="section-title" style="margin-top:22px"><h2>Generated documents</h2>
+      <span class="t-meta">what certumalink_run produced - preview and import them</span>
+      <span class="docimport-pick">import into
+        <select class="sel" id="doc-campaign">{camp_opts}</select></span></div>
+    <div id="docs"><div class="t-meta">No documents yet. Run
+      <code>certumalink_run --zip 78701</code> (add <code>--fixture</code> to use the bundled sample offline).</div></div>
+    <div id="doc-preview"></div>
     <div class="section-title" style="margin-top:22px"><h2>Commands</h2></div>
     <div class="card pad0"><table class="tbl">
       <thead><tr><th>Command</th><th>What it does</th></tr></thead>
@@ -1418,6 +1506,34 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
         result = webterm.run_command(body.command)
         return {"ok": result.ok, "command": result.command, "exit_code": result.exit_code,
                 "output": result.output, "error": result.error}
+
+    @app.get("/terminal/documents")
+    def terminal_documents():
+        return {"runs": webterm.list_documents()}
+
+    @app.get("/terminal/documents/view")
+    def terminal_document_view(rel: str):
+        try:
+            return webterm.read_document(rel)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.post("/terminal/documents/import")
+    def terminal_document_import(request: Request, body: DocImportBody, db: Session = Depends(get_db)):
+        if not auth.can_write((getattr(request.state, "user", None) or {}).get("role")):
+            raise HTTPException(status_code=403, detail="this role is read-only")
+        try:
+            result = docimport.import_document(db, body.rel, campaign=(body.campaign or None))
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=str(exc))
+        except (IntegrityError, DataError):
+            db.rollback()
+            raise HTTPException(status_code=400, detail="the document could not be imported")
+        db.commit()
+        return {"created": result.created, "updated": result.updated,
+                "leads_created": result.leads_created, "skipped": result.skipped,
+                "total": result.total}
 
     @app.get("/analytics", response_class=HTMLResponse)
     def analytics_page(db: Session = Depends(get_db)):

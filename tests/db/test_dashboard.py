@@ -26,7 +26,10 @@ except Exception:  # pragma: no cover
     HAVE_DEPS = False
 
 if HAVE_DEPS:
-    from certuma import reply_drafter
+    import shutil
+    import tempfile
+    from pathlib import Path as _Path
+    from certuma import reply_drafter, webterm
     from certuma.config import Settings
     from certuma.api.app import create_app, get_db
     from certuma.db.models import (AccessLog, Approval, Campaign, ClinicianSignal, Contact, Event,
@@ -89,12 +92,17 @@ class DashboardTests(unittest.TestCase):
         self.app.dependency_overrides[get_db] = self._override
         self.client = TestClient(self.app)
         _auth(self.client)  # authenticated as operator for all dashboard requests (P3.9)
+        # isolate the terminal's document workspace so tests never touch the live /tmp/certuma-docs
+        self._real_docs = webterm.DOCS_ROOT
+        webterm.DOCS_ROOT = _Path(tempfile.mkdtemp(prefix="certuma-docs-test-"))
 
     def tearDown(self):
         self.client.close()
         self.session.close()
         self.trans.rollback()
         self.conn.close()
+        shutil.rmtree(webterm.DOCS_ROOT, ignore_errors=True)
+        webterm.DOCS_ROOT = self._real_docs
 
     def _override(self):
         yield self.session
@@ -327,20 +335,54 @@ class DashboardTests(unittest.TestCase):
     def test_terminal_page_renders(self):
         r = self.client.get("/terminal")
         self.assertEqual(r.status_code, 200)
-        for marker in ("Console", "certuma&gt;", "runTerminal(", "import-demo", "seed-active",
-                       "allowlist, not a shell"):
+        for marker in ("Console", "certuma&gt;", "runTerminal(", "certumalink_run", "seed-active",
+                       "Generated documents", "loadDocuments(", "allowlist, not a shell"):
             self.assertIn(marker, r.text)
         # command output is escaped client-side before it is injected (XSS boundary)
         self.assertIn("_termEsc", r.text)
 
-    def test_terminal_run_import_demo_offline(self):
-        # the offline fixture import actually runs a subprocess but touches no DB and no network
-        r = self.client.post("/terminal/run", json={"command": "import-demo"})
+    def test_terminal_runs_certumalink_run_and_surfaces_documents(self):
+        # the real importer runs offline via the bundled fixture; touches no network and no DB
+        r = self.client.post("/terminal/run",
+                             json={"command": "certumalink_run --zip 78701 --fixture"})
         self.assertEqual(r.status_code, 200)
         d = r.json()
         self.assertTrue(d["ok"], d)
         self.assertEqual(d["exit_code"], 0)
-        self.assertIn("physician records", d["output"])
+        # the run produced a document bundle that the documents endpoint now lists
+        runs = self.client.get("/terminal/documents").json()["runs"]
+        self.assertTrue(runs)
+        doctors = next((f for f in runs[0]["files"] if f["name"] == "doctors.csv"), None)
+        self.assertIsNotNone(doctors)
+        self.assertTrue(doctors["importable"])
+        # preview the doctors document
+        view = self.client.get("/terminal/documents/view", params={"rel": doctors["rel"]}).json()
+        self.assertEqual(view["kind"], "csv")
+        self.assertIn("npi", view["header"])
+        # import it into the platform -> prospects + leads
+        imp = self.client.post("/terminal/documents/import",
+                               json={"rel": doctors["rel"], "campaign": "primary-care"})
+        self.assertEqual(imp.status_code, 200)
+        body = imp.json()
+        self.assertGreaterEqual(body["created"], 1)
+        self.assertGreaterEqual(body["leads_created"], 1)
+
+    def test_terminal_documents_view_refuses_traversal(self):
+        self.assertEqual(self.client.get("/terminal/documents/view",
+                                         params={"rel": "../../etc/passwd"}).status_code, 404)
+
+    def test_terminal_document_import_validation_and_rbac(self):
+        # a bad campaign / out-of-workspace path is a 400
+        self.assertEqual(self.client.post("/terminal/documents/import",
+                                          json={"rel": "x/y.csv", "campaign": "nope"}).status_code, 400)
+        unauth = TestClient(self.app)  # no session cookie
+        self.assertEqual(unauth.post("/terminal/documents/import",
+                                     json={"rel": "x/y.csv"}).status_code, 401)
+        c = TestClient(self.app)
+        _auth(c, role="leadership")
+        self.assertEqual(c.post("/terminal/documents/import",
+                                json={"rel": "x/y.csv"}).status_code, 403)  # read-only role
+        self.assertEqual(c.get("/terminal/documents").status_code, 200)     # but may read
 
     def test_terminal_help_and_unknown_command(self):
         ok = self.client.post("/terminal/run", json={"command": "help"}).json()
