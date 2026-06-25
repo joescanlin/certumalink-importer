@@ -15,7 +15,8 @@ from .anthropic_provider import AnthropicSupportClassifier
 
 # node.py needs SQLAlchemy; import it lazily so the pure classifier/provider can be used (and unit
 # tested) without a DB stack present, mirroring how the rest of certuma keeps its no-DB import path.
-_NODE_NAMES = ("SupportOutcome", "SupportSummary", "emit_sales_signal", "handle_ticket", "run_support")
+_NODE_NAMES = ("SupportOutcome", "SupportSummary", "emit_sales_signal", "handle_ticket", "run_support",
+               "reclassify", "override_intent", "set_status", "bulk_set_status")
 
 __all__ = [
     "SUPPORT_INTENTS", "SUPPORT_SIGNALS", "EXPANSION_INTENT", "ADVOCATE", "CHURN_RISK", "EFFECTS",

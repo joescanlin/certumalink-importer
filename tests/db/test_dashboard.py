@@ -646,6 +646,119 @@ class DashboardTests(unittest.TestCase):
     def test_support_nav_link_present(self):
         self.assertIn('href="/support"', self.client.get("/").text)
 
+    # ---- support + campaign drill-in detail (PR c) ----
+    def test_support_detail_page_renders_with_actions(self):
+        from certuma import support
+        npi = "1000000030"
+        self.session.add(Prospect(npi=npi, display_name="Dr Detail", primary_specialty="Dermatology"))
+        self.session.flush()
+        ticket, _ = support.handle_ticket(self.session, npi=npi,
+                                          body="We want to add more seats for our group.")
+        self.session.flush()
+        r = self.client.get(f"/support/{ticket.id}")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Dr Detail", "Override intent", "Re-classify", "Resolve", "Back to support",
+                       "Sales signal", "ticketAction("):
+            self.assertIn(marker, r.text)
+        self.assertIn("does not exist", self.client.get("/support/99999999").text)
+
+    def test_support_ticket_action_resolve_override_and_errors(self):
+        from certuma import support
+        from certuma.db.models import ClinicianSignal
+        npi = "1000000031"
+        self.session.add(Prospect(npi=npi, display_name="Dr Action"))
+        self.session.flush()
+        ticket, _ = support.handle_ticket(self.session, npi=npi, body="how do i edit?")
+        self.session.flush()
+        r = self.client.post(f"/support/{ticket.id}/action", json={"action": "resolve"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "resolved")
+        o = self.client.post(f"/support/{ticket.id}/action",
+                             json={"action": "override", "intent": "expansion_interest"})
+        self.assertEqual(o.json()["intent"], "expansion_interest")
+        sig = self.session.execute(select(ClinicianSignal).where(
+            ClinicianSignal.npi == npi, ClinicianSignal.source == "support")).scalar()
+        self.assertIsNotNone(sig)  # the override wrote an upsell signal into the graph
+        self.assertEqual(self.client.post(f"/support/{ticket.id}/action",
+                                          json={"action": "nope"}).status_code, 400)
+        self.assertEqual(self.client.post(f"/support/{ticket.id}/action",
+                                          json={"action": "override"}).status_code, 400)
+        self.assertEqual(self.client.post("/support/99999999/action",
+                                          json={"action": "resolve"}).status_code, 404)
+
+    def test_support_bulk_action(self):
+        from certuma import support
+        ids = []
+        for i in range(2):
+            npi = f"100000004{i}"
+            self.session.add(Prospect(npi=npi, display_name=f"Dr Bulk{i}"))
+            self.session.flush()
+            t, _ = support.handle_ticket(self.session, npi=npi, body="how do i edit?")
+            self.session.flush()
+            ids.append(t.id)
+        r = self.client.post("/support/bulk", json={"ids": ids, "action": "escalated"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["updated"], 2)
+        # valid + bogus ids -> only the valid ones counted; empty list -> 0; bad action -> 400
+        self.assertEqual(self.client.post("/support/bulk",
+                                          json={"ids": ids + [99999999], "action": "resolved"}).json()["updated"], 2)
+        self.assertEqual(self.client.post("/support/bulk",
+                                          json={"ids": [], "action": "resolved"}).json()["updated"], 0)
+        self.assertEqual(self.client.post("/support/bulk",
+                                          json={"ids": ids, "action": "nope"}).status_code, 400)
+
+    def test_support_detail_shows_signal_and_other_tickets(self):
+        from certuma import support
+        npi = "1000000050"
+        self.session.add(Prospect(npi=npi, display_name="Dr Two"))
+        self.session.flush()
+        t1, _ = support.handle_ticket(self.session, npi=npi, body="We want to add more seats.")
+        t2, _ = support.handle_ticket(self.session, npi=npi, body="how do i edit?")
+        self.session.flush()
+        text = self.client.get(f"/support/{t1.id}").text
+        self.assertIn("written to the knowledge graph", text)   # the populated signal-card branch
+        self.assertIn(f'href="/support/{t2.id}"', text)         # other ticket from the same clinician
+
+    def test_support_list_rows_link_and_offer_bulk(self):
+        from certuma import support
+        npi = "1000000045"
+        self.session.add(Prospect(npi=npi, display_name="Dr Link"))
+        self.session.flush()
+        t, _ = support.handle_ticket(self.session, npi=npi, body="how do i edit?")
+        self.session.flush()
+        body = self.client.get("/support").text
+        self.assertIn(f'href="/support/{t.id}"', body)
+        self.assertIn("bulkSupport(", body)
+
+    def test_campaign_detail_page_renders(self):
+        r = self.client.get("/campaigns/dermatology")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Lead funnel", "Templates", "Recent activity", "Back to campaigns",
+                       "dermatology", "campaignSet("):
+            self.assertIn(marker, r.text)
+        self.assertIn("does not exist", self.client.get("/campaigns/nope-campaign").text)
+
+    def test_campaign_list_rows_link_to_detail(self):
+        self.assertIn('href="/campaigns/dermatology"', self.client.get("/campaigns").text)
+
+    def test_campaign_detail_renders_for_an_empty_campaign(self):
+        from certuma.db.models import Campaign
+        self.session.add(Campaign(name="empty-camp", label="Empty", is_active=True))
+        self.session.flush()
+        r = self.client.get("/campaigns/empty-camp")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("No leads in this campaign yet.", "No templates for this campaign.",
+                       "No messages yet."):
+            self.assertIn(marker, r.text)
+
+    def test_drilldown_actions_are_read_only_for_leadership(self):
+        c = TestClient(self.app)
+        _auth(c, role="leadership")
+        self.assertEqual(c.get("/campaigns/dermatology").status_code, 200)   # may read the detail
+        self.assertEqual(c.post("/support/bulk",
+                                json={"ids": [1], "action": "resolved"}).status_code, 403)
+        self.assertEqual(c.post("/support/1/action", json={"action": "resolve"}).status_code, 403)
+
     # ---- inbound reply webhook (Phase 2) ----
     def test_inbound_reply_classifies_and_transitions(self):
         npi = "1000000006"
