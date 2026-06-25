@@ -28,7 +28,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from certuma import (agents, auth, composer, engagement, gate, inbound, intelligence, learning,
-                     monitor, orchestrator, reporting, support)
+                     monitor, orchestrator, reporting, support, webterm)
 from certuma.classifier import StubReplyClassifier
 from certuma.config import get_settings
 from certuma.observability import get_logger
@@ -155,6 +155,10 @@ class AgentCreateBody(BaseModel):
     activate: bool = False
 
 
+class TerminalBody(BaseModel):
+    command: str = Field(..., max_length=200)
+
+
 class AgentUpdateBody(BaseModel):
     name: Optional[str] = None
     model: Optional[str] = None
@@ -166,8 +170,8 @@ _AUTONOMY_LEVELS = ("assisted", "supervised", "autonomous")
 # nav: (label, path). Only implemented screens are listed so there are no dead links.
 _NAV = (("Approvals", "/"), ("Recommended", "/recommended"), ("Escalations", "/escalations"),
         ("Support", "/support"), ("Campaigns", "/campaigns"), ("Templates", "/studio"),
-        ("Agents", "/agents"), ("Analytics", "/analytics"), ("Leadership", "/leadership"),
-        ("Activity", "/activity"))
+        ("Agents", "/agents"), ("Terminal", "/terminal"), ("Analytics", "/analytics"),
+        ("Leadership", "/leadership"), ("Activity", "/activity"))
 
 # The agent workflow, for the Agent Studio diagram: (lane, [(name, kind, model, role)]).
 # kind 'llm' = a tunable Claude agent (teal); 'node' = a deterministic step (no prompt).
@@ -330,6 +334,35 @@ function insertComposed() {{
     .then(() => location.reload())
     .catch(e => {{ status.className = 'lint-result bad';
       status.textContent = (e && e.detail) ? e.detail : 'Insert failed'; }});
+}}
+function _termEsc(s) {{ return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }}
+function termFill(cmd) {{ const i = document.getElementById('term-cmd'); i.value = cmd; i.focus(); }}
+function _termAppend(htm) {{
+  const out = document.getElementById('term-out');
+  out.insertAdjacentHTML('beforeend', htm);
+  out.scrollTop = out.scrollHeight;
+}}
+async function runTerminal() {{
+  const inp = document.getElementById('term-cmd');
+  const cmd = inp.value.trim();
+  if (!cmd) return;
+  _termAppend('<div class="term-line"><span class="term-prompt">certuma&gt;</span> ' + _termEsc(cmd) + '</div>');
+  inp.value = ''; inp.disabled = true;
+  _termAppend('<div class="term-line t-dim" id="term-running">running...</div>');
+  try {{
+    const r = await fetch('/terminal/run', {{method: 'POST', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{command: cmd}})}});
+    const d = await r.json();
+    const run = document.getElementById('term-running'); if (run) run.remove();
+    if (d.error) _termAppend('<div class="term-line term-err">' + _termEsc(d.error) + '</div>');
+    if (d.output) _termAppend('<pre class="term-pre">' + _termEsc(d.output) + '</pre>');
+    const code = (d.exit_code === null || d.exit_code === undefined) ? '' : (' (exit ' + d.exit_code + ')');
+    _termAppend('<div class="term-line ' + (d.ok ? 't-ok' : 'term-err') + '">' + (d.ok ? 'done' : 'failed') + code + '</div>');
+  }} catch (e) {{
+    const run = document.getElementById('term-running'); if (run) run.remove();
+    _termAppend('<div class="term-line term-err">request failed</div>');
+  }}
+  inp.disabled = false; inp.focus();
 }}
 </script>
 </body></html>"""
@@ -695,6 +728,33 @@ def _agents_body(db: Session) -> str:
       <span class="t-meta">edit a prompt, then Save - it drives the live Claude agent</span></div>
     {"".join(cards)}
     {new_form}"""
+
+
+def _terminal_body(db: Session) -> str:
+    palette = "".join(
+        f'<button class="btn btn-sm btn-secondary" onclick="termFill(\'{html.escape(c.key)}\')">'
+        f'{html.escape(c.label)}</button>' for c in webterm.COMMANDS.values())
+    cmd_rows = "".join(
+        f'<tr><td><code>{html.escape(c.key)}</code></td>'
+        f'<td class="t-meta">{html.escape(c.description)}</td></tr>'
+        for c in webterm.COMMANDS.values())
+    return f"""
+    <div class="section-title"><h2>Console</h2>
+      <span class="t-meta">run the platform's data tools; this is an allowlist, not a shell</span></div>
+    <div class="term" id="term">
+      <div class="term-out" id="term-out"><div class="term-line t-dim">Type a command, or `help`. Try `import-demo` or `seed-active`.</div></div>
+      <div class="term-input">
+        <span class="term-prompt">certuma&gt;</span>
+        <input class="term-cmd" id="term-cmd" autocomplete="off" spellcheck="false"
+               placeholder="help" onkeydown="if(event.key==='Enter')runTerminal()">
+        <button class="btn btn-sm btn-primary" onclick="runTerminal()">Run</button>
+      </div>
+    </div>
+    <div class="term-palette">{palette}</div>
+    <div class="section-title" style="margin-top:22px"><h2>Commands</h2></div>
+    <div class="card pad0"><table class="tbl">
+      <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+      <tbody>{cmd_rows}</tbody></table></div>"""
 
 
 def _escalations_body(db: Session) -> str:
@@ -1103,6 +1163,22 @@ def create_app(settings=None, email_provider=None, classifier=None) -> FastAPI:
         return {"id": tpl.id, "campaign": tpl.campaign, "version": tpl.version,
                 "variant_label": tpl.variant_label, "message_type": tpl.message_type,
                 "model": tpl.model, "is_approved": tpl.is_approved}
+
+    @app.get("/terminal", response_class=HTMLResponse)
+    def terminal_page(db: Session = Depends(get_db)):
+        return _shell(db, "/terminal", eyebrow="Operations", title="Terminal",
+                      subtitle="Run the platform's data tools (the doctor importer, seeders, the "
+                               "scheduler) from an allowlisted in-console terminal.",
+                      body=_terminal_body(db))
+
+    @app.post("/terminal/run")
+    def terminal_run(request: Request, body: TerminalBody):
+        # defense in depth: the middleware already blocks read-only roles on non-GET, assert it here too
+        if not auth.can_write((getattr(request.state, "user", None) or {}).get("role")):
+            raise HTTPException(status_code=403, detail="this role is read-only")
+        result = webterm.run_command(body.command)
+        return {"ok": result.ok, "command": result.command, "exit_code": result.exit_code,
+                "output": result.output, "error": result.error}
 
     @app.get("/analytics", response_class=HTMLResponse)
     def analytics_page(db: Session = Depends(get_db)):

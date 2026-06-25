@@ -636,3 +636,58 @@ strong {
   color: var(--fg-2);
   margin: 4px 0 12px;
 }
+
+/* ---- web terminal ---- */
+.term {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-card-sm);
+  overflow: hidden;
+  background: #1c1a18;
+  box-shadow: var(--shadow-card, 0 1px 2px rgba(0,0,0,0.06));
+}
+.term-out {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #e7e2da;
+  padding: 14px 16px;
+  max-height: 360px;
+  min-height: 150px;
+  overflow-y: auto;
+}
+.term-line { white-space: pre-wrap; word-break: break-word; }
+.term-pre {
+  font-family: inherit;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #cfc9c0;
+  margin: 2px 0 6px;
+}
+.term-prompt { color: #6fb3a8; font-weight: 600; margin-right: 6px; }
+.term-err { color: #e09b8f; }
+.t-ok { color: #8fcaa6; }
+.t-dim { color: #8d877d; }
+.term-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid #2c2926;
+  background: #211e1b;
+}
+.term-cmd {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: #f0ece5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+.term-cmd::placeholder { color: #6b665e; }
+.term-palette { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 2px; }
+.term-out code, .tbl code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}

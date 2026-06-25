@@ -323,6 +323,40 @@ class DashboardTests(unittest.TestCase):
         r = self.client.post("/studio/compose", json={"message_type": "first_touch", "model": "gpt-4"})
         self.assertEqual(r.status_code, 400)
 
+    # ---- web terminal (Operations) ----
+    def test_terminal_page_renders(self):
+        r = self.client.get("/terminal")
+        self.assertEqual(r.status_code, 200)
+        for marker in ("Console", "certuma&gt;", "runTerminal(", "import-demo", "seed-active",
+                       "allowlist, not a shell"):
+            self.assertIn(marker, r.text)
+        # command output is escaped client-side before it is injected (XSS boundary)
+        self.assertIn("_termEsc", r.text)
+
+    def test_terminal_run_import_demo_offline(self):
+        # the offline fixture import actually runs a subprocess but touches no DB and no network
+        r = self.client.post("/terminal/run", json={"command": "import-demo"})
+        self.assertEqual(r.status_code, 200)
+        d = r.json()
+        self.assertTrue(d["ok"], d)
+        self.assertEqual(d["exit_code"], 0)
+        self.assertIn("physician records", d["output"])
+
+    def test_terminal_help_and_unknown_command(self):
+        ok = self.client.post("/terminal/run", json={"command": "help"}).json()
+        self.assertTrue(ok["ok"])
+        self.assertIn("seed-active", ok["output"])
+        bad = self.client.post("/terminal/run", json={"command": "rm -rf /"}).json()
+        self.assertFalse(bad["ok"])
+        self.assertIsNone(bad["exit_code"])  # never spawned a process
+        self.assertIn("not an allowed command", bad["error"])
+
+    def test_terminal_requires_auth_and_is_read_only_for_leadership(self):
+        c = TestClient(self.app)  # unauth
+        self.assertEqual(c.post("/terminal/run", json={"command": "help"}).status_code, 401)
+        _auth(c, role="leadership")
+        self.assertEqual(c.post("/terminal/run", json={"command": "help"}).status_code, 403)
+
     # ---- activity / funnel ----
     def test_activity_page_renders_funnel(self):
         from datetime import datetime, timezone
